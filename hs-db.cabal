@@ -1,0 +1,63 @@
+cabal-version:   3.14
+name:            hs-db
+version:         0.1.0.0
+license:         NONE
+author:          Samuel Schlesinger
+maintainer:      sgschlesinger@gmail.com
+build-type:      Simple
+extra-doc-files: CHANGELOG.md
+
+common warnings
+    ghc-options: -Wall
+
+library
+    import:           warnings
+    exposed-modules:
+        HsDb
+        HsDb.Types
+        HsDb.Table
+        HsDb.WAL.Types
+        HsDb.WAL.Serialize
+        HsDb.WAL.Writer
+        HsDb.WAL.Replay
+        HsDb.Integration
+    build-depends:
+        base ^>=4.18.3.0,
+        stm,
+        containers,
+        vector,
+        binary,
+        bytestring,
+        text,
+        time,
+        digest,
+        unix,
+        directory
+    hs-source-dirs:   src
+    default-language: Haskell2010
+
+test-suite hs-db-test
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    main-is:          Main.hs
+    other-modules:
+        Test.HsDb.Generators
+        Test.HsDb.Table
+        Test.HsDb.WAL.Serialize
+        Test.HsDb.WAL.Replay
+        Test.HsDb.Integration
+    build-depends:
+        base ^>=4.18.3.0,
+        hs-db,
+        hedgehog,
+        stm,
+        containers,
+        vector,
+        bytestring,
+        text,
+        time,
+        temporary,
+        directory,
+        filepath
+    hs-source-dirs:   test
+    default-language: Haskell2010
