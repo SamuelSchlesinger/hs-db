@@ -1,5 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | In-memory table storage engine. Tables are STM-backed maps from 'RowId'
+-- to 'Row', with schema validation on every mutation.
 module HsDb.Table
   ( Table(..)
   , TableCatalog

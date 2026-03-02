@@ -1,6 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
+-- | Main public API for hs-db. Provides bracket-style database lifecycle
+-- management, synchronous durable operations that block until fsync, and
+-- async variants that return a durability waiter.
 module HsDb
   ( -- * Database lifecycle
     withDatabase
@@ -114,6 +117,7 @@ selectAll db name = atomically $ selectAllSTM db name
 
 -- Synchronous durable operations --
 
+-- | Create a table, blocking until the WAL entry is fsynced to disk.
 durableCreateTable :: Database -> TableName -> Schema -> IO (Either DbError ())
 durableCreateTable db name schema = do
   result <- atomically $ createTableSTM db name schema
@@ -123,6 +127,8 @@ durableCreateTable db name schema = do
       atomically $ takeTMVar callback
       return (Right ())
 
+-- | Insert a row, blocking until the WAL entry is fsynced. Returns the
+-- assigned 'RowId' on success.
 durableInsert :: Database -> TableName -> Vector Value -> IO (Either DbError RowId)
 durableInsert db name row = do
   result <- atomically $ insertRowSTM db name row
@@ -132,6 +138,7 @@ durableInsert db name row = do
       atomically $ takeTMVar callback
       return (Right rowId)
 
+-- | Update an existing row in place, blocking until the WAL entry is fsynced.
 durableUpdate :: Database -> TableName -> RowId -> Vector Value -> IO (Either DbError ())
 durableUpdate db name rowId row = do
   result <- atomically $ updateRowSTM db name rowId row
@@ -141,6 +148,7 @@ durableUpdate db name rowId row = do
       atomically $ takeTMVar callback
       return (Right ())
 
+-- | Delete a row by ID, blocking until the WAL entry is fsynced.
 durableDelete :: Database -> TableName -> RowId -> IO (Either DbError ())
 durableDelete db name rowId = do
   result <- atomically $ deleteRowSTM db name rowId
@@ -150,6 +158,7 @@ durableDelete db name rowId = do
       atomically $ takeTMVar callback
       return (Right ())
 
+-- | Drop a table, blocking until the WAL entry is fsynced.
 durableDrop :: Database -> TableName -> IO (Either DbError ())
 durableDrop db name = do
   result <- atomically $ dropTableSTM db name
@@ -161,6 +170,8 @@ durableDrop db name = do
 
 -- Async variants --
 
+-- | Create a table, returning an @IO ()@ action that blocks until durable.
+-- The table is immediately visible to STM readers.
 asyncCreateTable :: Database -> TableName -> Schema
                  -> IO (Either DbError ((), IO ()))
 asyncCreateTable db name schema = do
@@ -170,6 +181,7 @@ asyncCreateTable db name schema = do
     Right (_, callback) ->
       return (Right ((), atomically (takeTMVar callback)))
 
+-- | Insert a row, returning the 'RowId' and a durability waiter.
 asyncInsert :: Database -> TableName -> Vector Value
             -> IO (Either DbError (RowId, IO ()))
 asyncInsert db name row = do
@@ -179,6 +191,7 @@ asyncInsert db name row = do
     Right (rowId, callback) ->
       return (Right (rowId, atomically (takeTMVar callback)))
 
+-- | Update a row, returning a durability waiter.
 asyncUpdate :: Database -> TableName -> RowId -> Vector Value
             -> IO (Either DbError ((), IO ()))
 asyncUpdate db name rowId row = do
@@ -188,6 +201,7 @@ asyncUpdate db name rowId row = do
     Right callback ->
       return (Right ((), atomically (takeTMVar callback)))
 
+-- | Delete a row, returning a durability waiter.
 asyncDelete :: Database -> TableName -> RowId
             -> IO (Either DbError ((), IO ()))
 asyncDelete db name rowId = do
@@ -197,6 +211,7 @@ asyncDelete db name rowId = do
     Right callback ->
       return (Right ((), atomically (takeTMVar callback)))
 
+-- | Drop a table, returning a durability waiter.
 asyncDrop :: Database -> TableName
           -> IO (Either DbError ((), IO ()))
 asyncDrop db name = do

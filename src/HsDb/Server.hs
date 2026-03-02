@@ -1,6 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
+-- | TCP server that accepts PostgreSQL-protocol connections and executes
+-- SQL queries against an hs-db 'Database'.
 module HsDb.Server
   ( runServer
   , ServerConfig(..)

@@ -1,5 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | PostgreSQL v3 wire protocol implementation. Handles startup negotiation,
+-- frontend message parsing, and backend message encoding.
 module HsDb.Server.Protocol
   ( -- * Frontend (client → server) messages
     FrontendMsg(..)
@@ -49,6 +51,8 @@ data FrontendMsg
 
 -- Reading bytes from a handle with buffering
 
+-- | Buffered read state for a client connection, carrying unconsumed bytes
+-- between message reads.
 type ReadState = IORef ByteString
 
 newReadState :: IO ReadState
@@ -163,7 +167,7 @@ sendBackendKeyData :: Handle -> Int -> Int -> IO ()
 sendBackendKeyData h pid secret =
   sendMsg h 0x4B (int32BE (fromIntegral pid) <> int32BE (fromIntegral secret))
 
--- | ReadyForQuery (Z, status: 'I'=idle, 'T'=in transaction, 'E'=failed transaction)
+-- | ReadyForQuery (Z, status: @I@=idle, @T@=in transaction, @E@=failed transaction)
 sendReadyForQuery :: Handle -> IO ()
 sendReadyForQuery h = do
   sendMsg h 0x5A (word8 0x49) -- 'Z', 'I' for idle

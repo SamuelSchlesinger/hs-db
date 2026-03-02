@@ -1,3 +1,4 @@
+-- | Core value types, column definitions, and error type shared across hs-db.
 module HsDb.Types
   ( Value(..)
   , ColumnType(..)
@@ -66,12 +67,21 @@ type TableName = Text
 -- | Errors that can occur during database operations.
 data DbError
   = TableAlreadyExists !TableName
+    -- ^ A table with this name already exists in the catalog.
   | TableNotFound !TableName
+    -- ^ No table with this name exists in the catalog.
   | RowNotFound !TableName !RowId
+    -- ^ The given row ID does not exist in the table.
   | SchemaViolation !Text
+    -- ^ A row did not match the table schema (wrong column count or type).
   | WALCorrupted !Text
+    -- ^ The WAL file contains invalid or unreadable data.
   | WALVersionMismatch !Int !Int  -- ^ expected, actual
+    -- ^ The WAL file header version does not match the expected version.
   | WALSequenceError !Text
+    -- ^ WAL sequence numbers are non-monotonic.
   | DatabaseNotWritable !Text
+    -- ^ A mutation was attempted on a read-only or shutting-down database.
   | DuplicateRowId !TableName !RowId
+    -- ^ A row with this ID already exists (during WAL replay).
   deriving (Show, Eq)

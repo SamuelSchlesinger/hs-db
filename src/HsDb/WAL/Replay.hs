@@ -1,5 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | WAL replay: reads a WAL file from disk and reconstructs the in-memory
+-- table catalog by re-applying each logged command in sequence order.
 module HsDb.WAL.Replay
   ( replayWAL
   ) where

@@ -1,3 +1,5 @@
+-- | Entry point for the @hs-db-server@ executable. Parses CLI flags, opens
+-- the database, and starts the PostgreSQL-protocol TCP server.
 module Main (main) where
 
 import System.Directory (createDirectoryIfMissing)

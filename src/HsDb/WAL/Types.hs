@@ -1,3 +1,5 @@
+-- | Shared types for the write-ahead log: commands, entries, configuration,
+-- and database status.
 module HsDb.WAL.Types
   ( WALCommand(..)
   , WALEntry(..)

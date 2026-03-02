@@ -1,3 +1,4 @@
+-- | Abstract syntax types for the SQL dialect supported by hs-db.
 module HsDb.SQL.Types
   ( Statement(..)
   , Expr(..)
@@ -13,7 +14,9 @@ import Data.Text (Text)
 -- | A parsed SQL statement.
 data Statement
   = CreateTable !Text [ColumnDef]
+    -- ^ @CREATE TABLE name (columns)@
   | DropTable !Text
+    -- ^ @DROP TABLE name@
   | Insert !Text [Text] [[Literal]]
     -- ^ table, column names, rows of values
   | Select [SelectTarget] !Text (Maybe Expr)

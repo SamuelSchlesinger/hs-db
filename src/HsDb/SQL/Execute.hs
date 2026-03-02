@@ -1,5 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | SQL execution engine. Translates parsed 'Statement's into durable
+-- database operations and returns structured 'QueryResult's.
 module HsDb.SQL.Execute
   ( executeSQL
   , QueryResult(..)

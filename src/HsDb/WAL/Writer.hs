@@ -2,6 +2,8 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
+-- | WAL writer and flusher thread. Opens the WAL file, assigns sequence
+-- numbers, batches writes, fsyncs to disk, and signals durability callbacks.
 module HsDb.WAL.Writer
   ( WALHandle(..)
   , openWAL

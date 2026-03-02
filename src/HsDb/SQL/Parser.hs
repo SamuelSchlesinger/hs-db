@@ -1,5 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Hand-written recursive-descent SQL parser. Supports CREATE TABLE, DROP
+-- TABLE, INSERT, SELECT, UPDATE, and DELETE with WHERE clauses.
 module HsDb.SQL.Parser
   ( parseSQL
   , ParseError(..)

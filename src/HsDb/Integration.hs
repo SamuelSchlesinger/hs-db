@@ -1,5 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Glue between the in-memory table engine and the WAL. Each STM function
+-- atomically applies a mutation to the catalog and enqueues the corresponding
+-- WAL command, returning a durability callback.
 module HsDb.Integration
   ( Database(..)
   , createTableSTM

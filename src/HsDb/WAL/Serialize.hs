@@ -1,5 +1,8 @@
 {-# OPTIONS_GHC -Wno-orphans #-}
 
+-- | Binary serialization for WAL entries. Provides CRC32-framed encoding\/
+-- decoding and WAL file header read\/write. Orphan 'Binary' instances live
+-- here to keep "HsDb.WAL.Types" free of serialization dependencies.
 module HsDb.WAL.Serialize
   ( encodeFramed
   , decodeFramed
