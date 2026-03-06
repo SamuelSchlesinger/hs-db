@@ -10,8 +10,11 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 
 import HsDb
+import HsDb.Integration (Database(..), atomicallyE, commitPendingOps)
 import HsDb.SQL.Parser (parseSQL)
 import HsDb.SQL.Execute
+import HsDb.SQL.Types (Statement(..))
+import HsDb.Transaction
 
 executeTests :: Group
 executeTests = Group "SQL.Execute"
@@ -27,6 +30,18 @@ executeTests = Group "SQL.Execute"
   , ("prop_select_mixed_star_error", prop_select_mixed_star_error)
   , ("prop_null_handling", prop_null_handling)
   , ("prop_multi_row_insert", prop_multi_row_insert)
+  , ("prop_order_by_asc", prop_order_by_asc)
+  , ("prop_order_by_desc", prop_order_by_desc)
+  , ("prop_order_by_multi", prop_order_by_multi)
+  , ("prop_limit", prop_limit)
+  , ("prop_offset", prop_offset)
+  , ("prop_order_by_limit", prop_order_by_limit)
+  , ("prop_order_by_null", prop_order_by_null)
+  , ("prop_tx_commit", prop_tx_commit)
+  , ("prop_tx_rollback", prop_tx_rollback)
+  , ("prop_tx_select_sees_pending", prop_tx_select_sees_pending)
+  , ("prop_tx_drop_rollback", prop_tx_drop_rollback)
+  , ("prop_tx_abort_on_error", prop_tx_abort_on_error)
   ]
 
 -- Run a SQL string against a fresh database in a temp directory.
@@ -39,7 +54,7 @@ execSQL :: Database -> Text -> IO (Either String QueryResult)
 execSQL db sql = case parseSQL sql of
   Left err -> return (Left ("Parse error: " ++ show err))
   Right stmt -> do
-    result <- runExceptT (executeSQL db stmt)
+    result <- runExceptT (executeSQL db Nothing stmt)
     case result of
       Left e  -> return (Left (show e))
       Right r -> return (Right r)
@@ -187,3 +202,167 @@ prop_multi_row_insert = withTests 1 $ property $ do
   case result of
     RowResult _ rows -> length rows === 3
     other -> do annotateShow other; failure
+
+prop_order_by_asc :: Property
+prop_order_by_asc = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (3), (1), (2)"
+    execSQL db "SELECT x FROM t ORDER BY x"
+  case result of
+    RowResult _ rows -> rows === [[Just "1"], [Just "2"], [Just "3"]]
+    other -> do annotateShow other; failure
+
+prop_order_by_desc :: Property
+prop_order_by_desc = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (3), (1), (2)"
+    execSQL db "SELECT x FROM t ORDER BY x DESC"
+  case result of
+    RowResult _ rows -> rows === [[Just "3"], [Just "2"], [Just "1"]]
+    other -> do annotateShow other; failure
+
+prop_order_by_multi :: Property
+prop_order_by_multi = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL, y INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x, y) VALUES (1, 2), (1, 1), (2, 1)"
+    execSQL db "SELECT x, y FROM t ORDER BY x ASC, y DESC"
+  case result of
+    RowResult _ rows -> rows === [[Just "1", Just "2"], [Just "1", Just "1"], [Just "2", Just "1"]]
+    other -> do annotateShow other; failure
+
+prop_limit :: Property
+prop_limit = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1), (2), (3), (4), (5)"
+    execSQL db "SELECT x FROM t LIMIT 3"
+  case result of
+    RowResult _ rows -> length rows === 3
+    other -> do annotateShow other; failure
+
+prop_offset :: Property
+prop_offset = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1), (2), (3), (4), (5)"
+    execSQL db "SELECT x FROM t ORDER BY x LIMIT 2 OFFSET 2"
+  case result of
+    RowResult _ rows -> rows === [[Just "3"], [Just "4"]]
+    other -> do annotateShow other; failure
+
+prop_order_by_limit :: Property
+prop_order_by_limit = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (5), (3), (1), (4), (2)"
+    execSQL db "SELECT x FROM t ORDER BY x DESC LIMIT 3"
+  case result of
+    RowResult _ rows -> rows === [[Just "5"], [Just "4"], [Just "3"]]
+    other -> do annotateShow other; failure
+
+prop_order_by_null :: Property
+prop_order_by_null = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (3), (NULL), (1)"
+    execSQL db "SELECT x FROM t ORDER BY x"
+  case result of
+    -- NULLs last in ASC order
+    RowResult _ rows -> rows === [[Just "1"], [Just "3"], [Nothing]]
+    other -> do annotateShow other; failure
+
+-- Helper for executing SQL in a transaction context
+execSQLTx :: Database -> Maybe TxState -> Text -> IO (Either String QueryResult)
+execSQLTx db mtx sql = case parseSQL sql of
+  Left err -> return (Left ("Parse error: " ++ show err))
+  Right stmt -> do
+    result <- runExceptT (executeSQL db mtx stmt)
+    case result of
+      Left e  -> return (Left (show e))
+      Right r -> return (Right r)
+
+commitTx :: Database -> TxState -> IO (Either String ())
+commitTx db tx = do
+  ops <- getPendingOps tx
+  result <- runExceptT $ atomicallyE $ commitPendingOps db ops
+  case result of
+    Left err -> return (Left (show err))
+    Right _  -> return (Right ())
+
+prop_tx_commit :: Property
+prop_tx_commit = withTests 1 $ property $ do
+  result <- evalIO $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    tx <- newTxState
+    _ <- execSQLTx db (Just tx) "INSERT INTO t (x) VALUES (1)"
+    _ <- execSQLTx db (Just tx) "INSERT INTO t (x) VALUES (2)"
+    _ <- commitTx db tx
+    execSQL db "SELECT x FROM t ORDER BY x"
+  case result of
+    Right (RowResult _ rows) -> rows === [[Just "1"], [Just "2"]]
+    Right other -> do annotateShow other; failure
+    Left e -> do annotate e; failure
+
+prop_tx_rollback :: Property
+prop_tx_rollback = withTests 1 $ property $ do
+  result <- evalIO $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1)"
+    tx <- newTxState
+    _ <- execSQLTx db (Just tx) "INSERT INTO t (x) VALUES (2)"
+    _ <- execSQLTx db (Just tx) "INSERT INTO t (x) VALUES (3)"
+    -- Don't commit — just drop tx (rollback)
+    execSQL db "SELECT x FROM t ORDER BY x"
+  case result of
+    Right (RowResult _ rows) -> rows === [[Just "1"]]
+    Right other -> do annotateShow other; failure
+    Left e -> do annotate e; failure
+
+prop_tx_select_sees_pending :: Property
+prop_tx_select_sees_pending = withTests 1 $ property $ do
+  result <- evalIO $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1)"
+    tx <- newTxState
+    _ <- execSQLTx db (Just tx) "INSERT INTO t (x) VALUES (2)"
+    execSQLTx db (Just tx) "SELECT x FROM t ORDER BY x"
+  case result of
+    Right (RowResult _ rows) -> rows === [[Just "1"], [Just "2"]]
+    Right other -> do annotateShow other; failure
+    Left e -> do annotate e; failure
+
+prop_tx_drop_rollback :: Property
+prop_tx_drop_rollback = withTests 1 $ property $ do
+  result <- evalIO $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (42)"
+    tx <- newTxState
+    _ <- execSQLTx db (Just tx) "DROP TABLE t"
+    -- Don't commit — table should survive
+    execSQL db "SELECT x FROM t"
+  case result of
+    Right (RowResult _ rows) -> rows === [[Just "42"]]
+    Right other -> do annotateShow other; failure
+    Left e -> do annotate e; failure
+
+prop_tx_abort_on_error :: Property
+prop_tx_abort_on_error = withTests 1 $ property $ do
+  result <- evalIO $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    tx <- newTxState
+    _ <- execSQLTx db (Just tx) "INSERT INTO t (x) VALUES (1)"
+    -- Insert into nonexistent table — should fail
+    r <- execSQLTx db (Just tx) "INSERT INTO nonexistent (x) VALUES (2)"
+    case r of
+      Left _ -> return ()
+      Right _ -> error "Expected error"
+    -- Even after the error, pending ops from before the error still exist
+    -- But the tx should not be committed if the user rolls back
+    execSQL db "SELECT x FROM t"
+  case result of
+    Right (RowResult _ rows) -> length rows === 0  -- nothing committed
+    Right other -> do annotateShow other; failure
+    Left e -> do annotate e; failure

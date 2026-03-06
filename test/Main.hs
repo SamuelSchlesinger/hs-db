@@ -9,6 +9,7 @@ import qualified Test.HsDb.WAL.Replay as Replay
 import qualified Test.HsDb.Integration as Integration
 import qualified Test.HsDb.SQL.Parser as Parser
 import qualified Test.HsDb.SQL.Execute as Execute
+import qualified Test.HsDb.Checkpoint as Checkpoint
 
 main :: IO ()
 main = do
@@ -19,6 +20,7 @@ main = do
     , checkParallel Integration.integrationTests
     , checkParallel Parser.parserTests
     , checkParallel Execute.executeTests
+    , checkParallel Checkpoint.checkpointTests
     ]
   if and results
     then exitSuccess

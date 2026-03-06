@@ -23,6 +23,8 @@ module HsDb
   , asyncDrop
     -- * Read operations
   , selectAll
+    -- * Checkpointing
+  , checkpoint
     -- * Types (re-exported)
   , Database
   , DatabaseConfig(..)
@@ -43,7 +45,7 @@ import Control.Concurrent.STM
 import Control.Exception (SomeException, bracket, finally, throwIO, try)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT)
-import Data.IORef (writeIORef)
+import Data.IORef (readIORef, writeIORef)
 import Data.Text (unpack, pack)
 import Data.Vector (Vector)
 import System.Directory (doesFileExist)
@@ -55,7 +57,8 @@ import HsDb.Integration (Database(..), createTableSTM, insertRowSTM,
                           atomicallyE)
 import HsDb.WAL.Types
 import HsDb.WAL.Writer (WALHandle(..), openWAL, closeWAL, flusherThread)
-import HsDb.WAL.Replay (replayWAL)
+import HsDb.WAL.Replay (replayWAL, replayWALWithCheckpoint)
+import HsDb.Checkpoint (writeCheckpoint)
 
 -- | Open a database using bracket-style resource management.
 withDatabase :: DatabaseConfig -> (Database -> IO a) -> IO a
@@ -76,7 +79,9 @@ openDatabase config = do
       h <- openBinaryFile path WriteMode
       hClose h
     else return ()
-  replayResult <- replayWAL path
+  replayResult <- case configCheckpointPath config of
+    Nothing   -> replayWAL path
+    Just cpPath -> replayWALWithCheckpoint cpPath path
   case replayResult of
     Left err -> throwIO (userError (show err))
     Right (catalog, lastSeq, _warnings) -> do
@@ -189,3 +194,12 @@ asyncDrop :: Database -> TableName
 asyncDrop db name = do
   callback <- atomicallyE $ dropTableSTM db name
   return ((), atomically (takeTMVar callback))
+
+-- | Write a checkpoint of the current database state.
+-- The checkpoint captures the committed state atomically via STM.
+-- Pass the WAL sequence number from the WALHandle to record the checkpoint point.
+checkpoint :: Database -> FilePath -> IO ()
+checkpoint db cpPath = do
+  walHandle <- readMVar (dbWALHandle db)
+  walSeq <- readIORef (walSeqCounter walHandle)
+  writeCheckpoint cpPath (dbCatalog db) walSeq

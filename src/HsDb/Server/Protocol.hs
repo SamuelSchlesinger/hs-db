@@ -17,6 +17,9 @@ module HsDb.Server.Protocol
   , sendCommandComplete
   , sendEmptyQueryResponse
   , sendErrorResponse
+    -- * Transaction indicator
+  , TxIndicator(..)
+  , sendReadyForQueryTx
     -- * Read state
   , ReadState
   ) where
@@ -170,10 +173,21 @@ sendBackendKeyData :: Handle -> Int -> Int -> IO ()
 sendBackendKeyData h pid secret =
   sendMsg h 0x4B (int32BE (fromIntegral pid) <> int32BE (fromIntegral secret))
 
+-- | Transaction status byte for ReadyForQuery.
+data TxIndicator = TxIdle | TxInBlock | TxFailed
+  deriving (Show, Eq)
+
 -- | ReadyForQuery (Z, status: @I@=idle, @T@=in transaction, @E@=failed transaction)
 sendReadyForQuery :: Handle -> IO ()
-sendReadyForQuery h = do
-  sendMsg h 0x5A (word8 0x49) -- 'Z', 'I' for idle
+sendReadyForQuery = sendReadyForQueryTx TxIdle
+
+sendReadyForQueryTx :: TxIndicator -> Handle -> IO ()
+sendReadyForQueryTx indicator h = do
+  let byte = case indicator of
+        TxIdle    -> 0x49 :: Word8  -- 'I'
+        TxInBlock -> 0x54           -- 'T'
+        TxFailed  -> 0x45           -- 'E'
+  sendMsg h 0x5A (word8 byte)
   hFlush h
 
 -- | RowDescription (T, field count, field descriptions)

@@ -137,6 +137,8 @@ pIdentifier s0 = do
       , "and", "or", "not", "null", "is", "true", "false"
       , "int", "integer", "bigint", "float", "double", "text"
       , "varchar", "boolean", "bool", "bytea", "precision"
+      , "order", "by", "limit", "offset", "asc", "desc"
+      , "begin", "commit", "rollback"
       ]
 
 -- Statements
@@ -151,7 +153,25 @@ pStatement s0 = do
   else if T.isPrefixOf "select" remaining then pSelect s
   else if T.isPrefixOf "update" remaining then pUpdate s
   else if T.isPrefixOf "delete" remaining then pDelete s
+  else if T.isPrefixOf "begin" remaining then pBegin s
+  else if T.isPrefixOf "commit" remaining then pCommit s
+  else if T.isPrefixOf "rollback" remaining then pRollback s
   else pFail ("Expected SQL statement but got '" <> T.take 20 (psInput s) <> "'") s
+
+pBegin :: Parser Statement
+pBegin s0 = do
+  ((), s1) <- pKeyword "BEGIN" s0
+  Right (Begin, s1)
+
+pCommit :: Parser Statement
+pCommit s0 = do
+  ((), s1) <- pKeyword "COMMIT" s0
+  Right (Commit, s1)
+
+pRollback :: Parser Statement
+pRollback s0 = do
+  ((), s1) <- pKeyword "ROLLBACK" s0
+  Right (Rollback, s1)
 
 -- CREATE TABLE name (col1 type1 [NOT NULL], ...)
 pCreateTable :: Parser Statement
@@ -296,15 +316,51 @@ pNumLit s0 = do
               in Right (LitInt val, s2)
             _ -> pFail ("Invalid number: " <> digits) s0
 
--- SELECT cols FROM table [WHERE expr]
+-- SELECT cols FROM table [WHERE expr] [ORDER BY ...] [LIMIT n] [OFFSET n]
 pSelect :: Parser Statement
 pSelect s0 = do
   ((), s1) <- pKeyword "SELECT" s0
   (targets, s2) <- pSelectTargets s1
   ((), s3) <- pKeyword "FROM" s2
   (name, s4) <- pIdentifier s3
-  (wh, s5) <- pOptional (pWhere) s4
-  Right (Select targets name wh, s5)
+  (wh, s5) <- pOptional pWhere s4
+  (mOrderBy, s6) <- pOptional pOrderBy s5
+  (mLimit, s7) <- pOptional pLimit s6
+  (mOffset, s8) <- pOptional pOffset s7
+  let orderClauses = maybe [] id mOrderBy
+  Right (Select targets name wh orderClauses mLimit mOffset, s8)
+
+pOrderBy :: Parser [OrderByClause]
+pOrderBy s0 = do
+  ((), s1) <- pKeyword "ORDER" s0
+  ((), s2) <- pKeyword "BY" s1
+  pCommaSep pOrderByClause s2
+
+pOrderByClause :: Parser OrderByClause
+pOrderByClause s0 = do
+  (col, s1) <- pIdentifier s0
+  (isDesc, s2) <- pTryKeyword "DESC" s1
+  if isDesc
+    then Right (OrderByClause col Desc, s2)
+    else do
+      (_, s3) <- pTryKeyword "ASC" s2
+      Right (OrderByClause col Asc, s3)
+
+pLimit :: Parser Int
+pLimit s0 = do
+  ((), s1) <- pKeyword "LIMIT" s0
+  (lit, s2) <- pNumLit s1
+  case lit of
+    LitInt n | n >= 0 -> Right (fromIntegral n, s2)
+    _ -> pFail "LIMIT must be a non-negative integer" s0
+
+pOffset :: Parser Int
+pOffset s0 = do
+  ((), s1) <- pKeyword "OFFSET" s0
+  (lit, s2) <- pNumLit s1
+  case lit of
+    LitInt n | n >= 0 -> Right (fromIntegral n, s2)
+    _ -> pFail "OFFSET must be a non-negative integer" s0
 
 pSelectTargets :: Parser [SelectTarget]
 pSelectTargets s0 = do

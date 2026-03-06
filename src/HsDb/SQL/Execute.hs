@@ -12,6 +12,8 @@ import Control.Concurrent.STM (STM, atomically, readTVar, takeTMVar)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, throwE, except, withExceptT)
 import Data.Int (Int32, Int64)
+import Data.List (sortBy)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Map.Strict as Map
@@ -22,7 +24,8 @@ import HsDb.Types
 import HsDb.Integration (Database(..), selectAllSTM, createTableSTM,
                           insertRowSTM, updateRowSTM, deleteRowSTM, dropTableSTM,
                           atomicallyE)
-import HsDb.Table (Table(..), TableCatalog)
+import HsDb.Table (Table(..), TableCatalog, validateRow)
+import HsDb.Transaction
 import HsDb.SQL.Types as SQL
 
 -- | Column metadata for result sets.
@@ -44,107 +47,198 @@ atomicallyDbError :: ExceptT DbError STM a -> ExceptT Text IO a
 atomicallyDbError = withExceptT (T.pack . show) . atomicallyE
 
 -- | Execute a parsed SQL statement against a Database.
-executeSQL :: Database -> Statement -> ExceptT Text IO QueryResult
-executeSQL db stmt = case stmt of
-  CreateTable name colDefs -> execCreateTable db name colDefs
-  DropTable name           -> execDropTable db name
-  Insert name cols valRows -> execInsert db name cols valRows
-  Select targets name wh   -> execSelect db name targets wh
-  Update name assigns wh   -> execUpdate db name assigns wh
-  Delete name wh           -> execDelete db name wh
+-- The Maybe TxState tracks whether we're inside a BEGIN block.
+executeSQL :: Database -> Maybe TxState -> Statement -> ExceptT Text IO QueryResult
+executeSQL db mtx stmt = case stmt of
+  CreateTable name colDefs -> execCreateTable db mtx name colDefs
+  DropTable name           -> execDropTable db mtx name
+  Insert name cols valRows -> execInsert db mtx name cols valRows
+  Select targets name wh orderBy limit offset
+                             -> execSelect db mtx name targets wh orderBy limit offset
+  Update name assigns wh   -> execUpdate db mtx name assigns wh
+  Delete name wh           -> execDelete db mtx name wh
+  Begin    -> throwE "BEGIN/COMMIT/ROLLBACK handled by server"
+  Commit   -> throwE "BEGIN/COMMIT/ROLLBACK handled by server"
+  Rollback -> throwE "BEGIN/COMMIT/ROLLBACK handled by server"
 
 -- CREATE TABLE
 
-execCreateTable :: Database -> Text -> [ColumnDef] -> ExceptT Text IO QueryResult
-execCreateTable db name colDefs = do
+execCreateTable :: Database -> Maybe TxState -> Text -> [ColumnDef] -> ExceptT Text IO QueryResult
+execCreateTable db Nothing name colDefs = do
   let schema = map columnDefToColumn colDefs
   (_, callback) <- atomicallyDbError $ createTableSTM db name schema
   lift $ atomically $ takeTMVar callback
   return (CommandComplete "CREATE TABLE")
+execCreateTable _db (Just tx) name colDefs = do
+  let schema = map columnDefToColumn colDefs
+  lift $ addPendingOp tx (PendingCreate name schema)
+  return (CommandComplete "CREATE TABLE")
 
 -- DROP TABLE
 
-execDropTable :: Database -> Text -> ExceptT Text IO QueryResult
-execDropTable db name = do
+execDropTable :: Database -> Maybe TxState -> Text -> ExceptT Text IO QueryResult
+execDropTable db Nothing name = do
   callback <- atomicallyDbError $ dropTableSTM db name
   lift $ atomically $ takeTMVar callback
   return (CommandComplete "DROP TABLE")
+execDropTable db (Just tx) name = do
+  -- Verify table exists (committed or pending create)
+  schema <- lift $ effectiveSchema (dbCatalog db) tx name
+  case schema of
+    Left err -> throwE err
+    Right _  -> do
+      lift $ addPendingOp tx (PendingDrop name)
+      return (CommandComplete "DROP TABLE")
 
 -- INSERT
 
-execInsert :: Database -> Text -> [Text] -> [[Literal]] -> ExceptT Text IO QueryResult
-execInsert db name cols valRows = do
+execInsert :: Database -> Maybe TxState -> Text -> [Text] -> [[Literal]] -> ExceptT Text IO QueryResult
+execInsert db Nothing name cols valRows = do
   schema <- getTableSchema (dbCatalog db) name
   colOrder <- except $ resolveColumns schema cols
-  n <- insertRows db name schema colOrder valRows 0
+  n <- insertRowsDirect db name schema colOrder valRows 0
+  return (CommandComplete ("INSERT 0 " <> T.pack (show n)))
+execInsert db (Just tx) name cols valRows = do
+  schema <- lift (effectiveSchema (dbCatalog db) tx name) >>= liftEither
+  colOrder <- except $ resolveColumns schema cols
+  n <- insertRowsTx tx name schema colOrder valRows 0
   return (CommandComplete ("INSERT 0 " <> T.pack (show n)))
 
-insertRows :: Database -> Text -> Schema -> [Int] -> [[Literal]] -> Int
-           -> ExceptT Text IO Int
-insertRows _ _ _ _ [] n = return n
-insertRows db name schema colOrder (lits:rest) n = do
+insertRowsDirect :: Database -> Text -> Schema -> [Int] -> [[Literal]] -> Int
+                 -> ExceptT Text IO Int
+insertRowsDirect _ _ _ _ [] n = return n
+insertRowsDirect db name schema colOrder (lits:rest) n = do
   row <- except $ buildRow schema colOrder lits
   (_, callback) <- atomicallyDbError $ insertRowSTM db name row
   lift $ atomically $ takeTMVar callback
-  insertRows db name schema colOrder rest (n + 1)
+  insertRowsDirect db name schema colOrder rest (n + 1)
+
+insertRowsTx :: TxState -> Text -> Schema -> [Int] -> [[Literal]] -> Int
+             -> ExceptT Text IO Int
+insertRowsTx _ _ _ _ [] n = return n
+insertRowsTx tx name schema colOrder (lits:rest) n = do
+  row <- except $ buildRow schema colOrder lits
+  except $ validateRowE schema row
+  lift $ addPendingOp tx (PendingInsert name row)
+  insertRowsTx tx name schema colOrder rest (n + 1)
 
 -- SELECT
 
-execSelect :: Database -> Text -> [SelectTarget] -> Maybe Expr
+execSelect :: Database -> Maybe TxState -> Text -> [SelectTarget] -> Maybe Expr
+           -> [OrderByClause] -> Maybe Int -> Maybe Int
            -> ExceptT Text IO QueryResult
-execSelect db name targets wh = do
+execSelect db Nothing name targets wh orderBy mLimit mOffset = do
   schema <- getTableSchema (dbCatalog db) name
   rows <- atomicallyDbError $ selectAllSTM db name
   (colInfos, colIdxs) <- except $ resolveSelectTargets schema targets
-  let filtered = case wh of
-        Nothing -> rows
-        Just expr -> filter (\(_, row) -> evalWhere schema expr row) rows
-  let projected = map (\(_, row) -> projectRow colIdxs row) filtered
+  let filtered = filterRows schema wh rows
+  sorted <- case orderBy of
+    [] -> return filtered
+    _  -> do
+      orderIdxs <- except $ resolveOrderByColumns schema orderBy
+      return (sortRows orderIdxs filtered)
+  let afterOffset = maybe id drop mOffset sorted
+  let afterLimit  = maybe id take mLimit afterOffset
+  let projected = map (\(_, row) -> projectRow colIdxs row) afterLimit
+  let textRows = map (map formatValue) projected
+  return (RowResult colInfos textRows)
+execSelect db (Just tx) name targets wh orderBy mLimit mOffset = do
+  schema <- lift (effectiveSchema (dbCatalog db) tx name) >>= liftEither
+  rowsResult <- lift $ effectiveRows (dbCatalog db) tx name
+  rows <- liftEither rowsResult
+  (colInfos, colIdxs) <- except $ resolveSelectTargets schema targets
+  let filtered = filterRows schema wh rows
+  sorted <- case orderBy of
+    [] -> return filtered
+    _  -> do
+      orderIdxs <- except $ resolveOrderByColumns schema orderBy
+      return (sortRows orderIdxs filtered)
+  let afterOffset = maybe id drop mOffset sorted
+  let afterLimit  = maybe id take mLimit afterOffset
+  let projected = map (\(_, row) -> projectRow colIdxs row) afterLimit
   let textRows = map (map formatValue) projected
   return (RowResult colInfos textRows)
 
 -- UPDATE
 
-execUpdate :: Database -> Text -> [(Text, Expr)] -> Maybe Expr
+execUpdate :: Database -> Maybe TxState -> Text -> [(Text, Expr)] -> Maybe Expr
            -> ExceptT Text IO QueryResult
-execUpdate db name assigns wh = do
+execUpdate db Nothing name assigns wh = do
   schema <- getTableSchema (dbCatalog db) name
   rows <- atomicallyDbError $ selectAllSTM db name
-  let matching = case wh of
-        Nothing -> rows
-        Just expr -> filter (\(_, row) -> evalWhere schema expr row) rows
-  n <- updateRows db name schema assigns matching 0
+  let matching = filterRows schema wh rows
+  n <- updateRowsDirect db name schema assigns matching 0
+  return (CommandComplete ("UPDATE " <> T.pack (show n)))
+execUpdate db (Just tx) name assigns wh = do
+  schema <- lift (effectiveSchema (dbCatalog db) tx name) >>= liftEither
+  rowsResult <- lift $ effectiveRows (dbCatalog db) tx name
+  rows <- liftEither rowsResult
+  let matching = filterRows schema wh rows
+  n <- updateRowsTx tx name schema assigns matching 0
   return (CommandComplete ("UPDATE " <> T.pack (show n)))
 
-updateRows :: Database -> Text -> Schema -> [(Text, Expr)] -> [(RowId, Row)] -> Int
-           -> ExceptT Text IO Int
-updateRows _ _ _ _ [] n = return n
-updateRows db name schema assigns ((rowId, row):rest) n = do
+updateRowsDirect :: Database -> Text -> Schema -> [(Text, Expr)] -> [(RowId, Row)] -> Int
+                 -> ExceptT Text IO Int
+updateRowsDirect _ _ _ _ [] n = return n
+updateRowsDirect db name schema assigns ((rowId, row):rest) n = do
   newRow <- except $ applyAssignments schema assigns row
   callback <- atomicallyDbError $ updateRowSTM db name rowId newRow
   lift $ atomically $ takeTMVar callback
-  updateRows db name schema assigns rest (n + 1)
+  updateRowsDirect db name schema assigns rest (n + 1)
+
+updateRowsTx :: TxState -> Text -> Schema -> [(Text, Expr)] -> [(RowId, Row)] -> Int
+             -> ExceptT Text IO Int
+updateRowsTx _ _ _ _ [] n = return n
+updateRowsTx tx name schema assigns ((rowId, row):rest) n = do
+  newRow <- except $ applyAssignments schema assigns row
+  lift $ addPendingOp tx (PendingUpdate name rowId newRow)
+  updateRowsTx tx name schema assigns rest (n + 1)
 
 -- DELETE
 
-execDelete :: Database -> Text -> Maybe Expr -> ExceptT Text IO QueryResult
-execDelete db name wh = do
+execDelete :: Database -> Maybe TxState -> Text -> Maybe Expr -> ExceptT Text IO QueryResult
+execDelete db Nothing name wh = do
   schema <- getTableSchema (dbCatalog db) name
   rows <- atomicallyDbError $ selectAllSTM db name
-  let matching = case wh of
-        Nothing -> rows
-        Just expr -> filter (\(_, row) -> evalWhere schema expr row) rows
-  n <- deleteRows db name matching 0
+  let matching = filterRows schema wh rows
+  n <- deleteRowsDirect db name matching 0
+  return (CommandComplete ("DELETE " <> T.pack (show n)))
+execDelete db (Just tx) name wh = do
+  schema <- lift (effectiveSchema (dbCatalog db) tx name) >>= liftEither
+  rowsResult <- lift $ effectiveRows (dbCatalog db) tx name
+  rows <- liftEither rowsResult
+  let matching = filterRows schema wh rows
+  n <- deleteRowsTx tx name matching 0
   return (CommandComplete ("DELETE " <> T.pack (show n)))
 
-deleteRows :: Database -> Text -> [(RowId, Row)] -> Int -> ExceptT Text IO Int
-deleteRows _ _ [] n = return n
-deleteRows db name ((rowId, _):rest) n = do
+deleteRowsDirect :: Database -> Text -> [(RowId, Row)] -> Int -> ExceptT Text IO Int
+deleteRowsDirect _ _ [] n = return n
+deleteRowsDirect db name ((rowId, _):rest) n = do
   callback <- atomicallyDbError $ deleteRowSTM db name rowId
   lift $ atomically $ takeTMVar callback
-  deleteRows db name rest (n + 1)
+  deleteRowsDirect db name rest (n + 1)
 
--- Helpers
+deleteRowsTx :: TxState -> Text -> [(RowId, Row)] -> Int -> ExceptT Text IO Int
+deleteRowsTx _ _ [] n = return n
+deleteRowsTx tx name ((rowId, _):rest) n = do
+  lift $ addPendingOp tx (PendingDelete name rowId)
+  deleteRowsTx tx name rest (n + 1)
+
+-- Shared helpers
+
+filterRows :: Schema -> Maybe Expr -> [(RowId, Row)] -> [(RowId, Row)]
+filterRows _ Nothing rows = rows
+filterRows schema (Just expr) rows =
+  filter (\(_, row) -> evalWhere schema expr row) rows
+
+liftEither :: Either Text a -> ExceptT Text IO a
+liftEither (Left e)  = throwE e
+liftEither (Right a) = return a
+
+validateRowE :: Schema -> Vector Value -> Either Text ()
+validateRowE schema row = case validateRow schema row of
+  Left err -> Left (T.pack (show err))
+  Right () -> Right ()
 
 columnDefToColumn :: ColumnDef -> Column
 columnDefToColumn cd = HsDb.Types.Column
@@ -169,7 +263,6 @@ getTableSchema catalog name = do
     Just table -> return (tableSchema table)
 
 -- Map column names from INSERT to schema positions.
--- Returns a list of schema indices in the order given by the INSERT column list.
 resolveColumns :: Schema -> [Text] -> Either Text [Int]
 resolveColumns schema cols = mapM findCol cols
   where
@@ -295,6 +388,40 @@ valCmp (VFloat64 a) (VInt32 b)   = Just (compare a (fromIntegral b))
 valCmp (VInt64 a)   (VFloat64 b) = Just (compare (fromIntegral a) b)
 valCmp (VFloat64 a) (VInt64 b)   = Just (compare a (fromIntegral b))
 valCmp _ _                       = Nothing
+
+-- ORDER BY helpers
+
+resolveOrderByColumns :: Schema -> [OrderByClause] -> Either Text [(Int, SortOrder)]
+resolveOrderByColumns schema clauses = mapM resolve clauses
+  where
+    indexed = zip (map columnName schema) [0..]
+    resolve (OrderByClause col order) =
+      case lookup col indexed of
+        Nothing -> Left ("ORDER BY column '" <> col <> "' does not exist in table")
+        Just i  -> Right (i, order)
+
+sortRows :: [(Int, SortOrder)] -> [(RowId, Row)] -> [(RowId, Row)]
+sortRows orderIdxs rows = sortBy comparator rows
+  where
+    comparator (_, rowA) (_, rowB) = mconcat
+      [applyOrder order (valCmpNull (rowA V.! idx) (rowB V.! idx))
+      | (idx, order) <- orderIdxs]
+
+    applyOrder Asc  o = o
+    applyOrder Desc o = flipOrd o
+
+    flipOrd LT = GT
+    flipOrd GT = LT
+    flipOrd EQ = EQ
+
+-- | NULL-aware comparison for sorting.
+-- NULLs are treated as larger than all non-NULL values, matching PostgreSQL:
+-- ASC  -> NULLs last;  DESC -> NULLs first.
+valCmpNull :: Value -> Value -> Ordering
+valCmpNull VNull VNull = EQ
+valCmpNull VNull _     = GT
+valCmpNull _     VNull = LT
+valCmpNull a     b     = fromMaybe EQ (valCmp a b)
 
 applyAssignments :: Schema -> [(Text, Expr)] -> Row -> Either Text (Vector Value)
 applyAssignments schema assigns row = do

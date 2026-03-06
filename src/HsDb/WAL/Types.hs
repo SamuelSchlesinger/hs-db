@@ -58,15 +58,17 @@ walVersion = 1
 
 -- | Configuration for opening a database.
 data DatabaseConfig = DatabaseConfig
-  { configQueueCapacity :: !Int       -- ^ TBQueue capacity (backpressure)
-  , configWALPath       :: !FilePath  -- ^ Path to the WAL file
+  { configQueueCapacity :: !Int        -- ^ TBQueue capacity (backpressure)
+  , configWALPath       :: !FilePath   -- ^ Path to the WAL file
+  , configCheckpointPath :: !(Maybe FilePath)  -- ^ Path to checkpoint file (Nothing = disabled)
   } deriving (Show, Eq)
 
--- | Default configuration: queue capacity of 1000.
+-- | Default configuration: queue capacity of 1000, no checkpointing.
 defaultDatabaseConfig :: FilePath -> DatabaseConfig
 defaultDatabaseConfig path = DatabaseConfig
-  { configQueueCapacity = 1000
-  , configWALPath       = path
+  { configQueueCapacity  = 1000
+  , configWALPath        = path
+  , configCheckpointPath = Nothing
   }
 
 -- | Current status of the database for write operations.

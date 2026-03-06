@@ -33,9 +33,17 @@ parseArgs ("--port":p:rest) cfg dir
   = parseArgs rest (cfg { serverPort = p }) dir
   | otherwise = Left ("Invalid port: " ++ p ++ " (must be 1-65535)")
 parseArgs ("--data-dir":d:rest) cfg _ = parseArgs rest cfg d
+parseArgs ("--max-connections":n:rest) cfg dir
+  | all isDigit n, not (null n)
+  = parseArgs rest (cfg { serverMaxConns = read n }) dir
+  | otherwise = Left ("Invalid max-connections: " ++ n)
+parseArgs ("--timeout":n:rest) cfg dir
+  | all isDigit n, not (null n)
+  = parseArgs rest (cfg { serverIdleTimeout = read n }) dir
+  | otherwise = Left ("Invalid timeout: " ++ n)
 parseArgs ("--help":_) _ _ = Left helpText
 parseArgs [flag] _ _
-  | flag `elem` ["--host", "--port", "--data-dir"]
+  | flag `elem` ["--host", "--port", "--data-dir", "--max-connections", "--timeout"]
   = Left ("Missing value for " ++ flag)
 parseArgs (unknown:_) _ _ = Left ("Unknown option: " ++ unknown)
 
@@ -44,8 +52,10 @@ helpText = unlines
   [ "Usage: hs-db-server [OPTIONS]"
   , ""
   , "Options:"
-  , "  --host HOST       Listen address (default: 127.0.0.1)"
-  , "  --port PORT       Listen port (default: 5433)"
-  , "  --data-dir DIR    Data directory (default: ./hs-db-data)"
-  , "  --help            Show this help"
+  , "  --host HOST              Listen address (default: 127.0.0.1)"
+  , "  --port PORT              Listen port (default: 5433)"
+  , "  --data-dir DIR           Data directory (default: ./hs-db-data)"
+  , "  --max-connections N      Max concurrent connections (default: 0 = unlimited)"
+  , "  --timeout N              Idle timeout in seconds (default: 0 = none)"
+  , "  --help                   Show this help"
   ]

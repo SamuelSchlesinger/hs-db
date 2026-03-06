@@ -28,6 +28,13 @@ parserTests = Group "SQL.Parser"
   , ("prop_quoted_identifier", prop_quoted_identifier)
   , ("prop_not_null_constraint", prop_not_null_constraint)
   , ("prop_trailing_semicolon", prop_trailing_semicolon)
+  , ("prop_order_by_single", prop_order_by_single)
+  , ("prop_order_by_desc", prop_order_by_desc)
+  , ("prop_order_by_multi", prop_order_by_multi)
+  , ("prop_limit", prop_limit)
+  , ("prop_limit_offset", prop_limit_offset)
+  , ("prop_order_by_limit", prop_order_by_limit)
+  , ("prop_where_order_limit_offset", prop_where_order_limit_offset)
   , ("prop_err_empty_input", prop_err_empty_input)
   , ("prop_err_unknown_type", prop_err_unknown_type)
   , ("prop_err_reserved_as_ident", prop_err_reserved_as_ident)
@@ -71,18 +78,19 @@ prop_insert_multi_row = withTests 1 $ property $ do
 prop_select_star :: Property
 prop_select_star = withTests 1 $ property $ do
   stmt <- expectRight $ parseSQL "SELECT * FROM users"
-  stmt === Select [Star] "users" Nothing
+  stmt === Select [Star] "users" Nothing [] Nothing Nothing
 
 prop_select_columns :: Property
 prop_select_columns = withTests 1 $ property $ do
   stmt <- expectRight $ parseSQL "SELECT id, name FROM users"
-  stmt === Select [Column "id", Column "name"] "users" Nothing
+  stmt === Select [Column "id", Column "name"] "users" Nothing [] Nothing Nothing
 
 prop_select_where :: Property
 prop_select_where = withTests 1 $ property $ do
   stmt <- expectRight $ parseSQL "SELECT * FROM users WHERE id = 1"
   stmt === Select [Star] "users"
     (Just (ExprBinOp OpEq (ExprColumn "id") (ExprLit (LitInt 1))))
+    [] Nothing Nothing
 
 prop_update_set :: Property
 prop_update_set = withTests 1 $ property $ do
@@ -100,7 +108,7 @@ prop_delete = withTests 1 $ property $ do
 prop_case_insensitive :: Property
 prop_case_insensitive = withTests 1 $ property $ do
   stmt <- expectRight $ parseSQL "select * from USERS"
-  stmt === Select [Star] "users" Nothing
+  stmt === Select [Star] "users" Nothing [] Nothing Nothing
 
 prop_where_and_or :: Property
 prop_where_and_or = withTests 1 $ property $ do
@@ -112,16 +120,19 @@ prop_where_and_or = withTests 1 $ property $ do
         (ExprBinOp OpEq (ExprColumn "a") (ExprLit (LitInt 1)))
         (ExprBinOp OpEq (ExprColumn "b") (ExprLit (LitInt 2))))
       (ExprBinOp OpEq (ExprColumn "c") (ExprLit (LitInt 3)))))
+    [] Nothing Nothing
 
 prop_where_is_null :: Property
 prop_where_is_null = withTests 1 $ property $ do
   stmt <- expectRight $ parseSQL "SELECT * FROM t WHERE x IS NULL"
   stmt === Select [Star] "t" (Just (ExprIsNull (ExprColumn "x")))
+    [] Nothing Nothing
 
 prop_where_is_not_null :: Property
 prop_where_is_not_null = withTests 1 $ property $ do
   stmt <- expectRight $ parseSQL "SELECT * FROM t WHERE x IS NOT NULL"
   stmt === Select [Star] "t" (Just (ExprIsNotNull (ExprColumn "x")))
+    [] Nothing Nothing
 
 prop_comparison_ops :: Property
 prop_comparison_ops = withTests 1 $ property $ do
@@ -151,7 +162,7 @@ prop_float_literal = withTests 1 $ property $ do
 prop_quoted_identifier :: Property
 prop_quoted_identifier = withTests 1 $ property $ do
   stmt <- expectRight $ parseSQL "SELECT \"select\" FROM t"
-  stmt === Select [Column "select"] "t" Nothing
+  stmt === Select [Column "select"] "t" Nothing [] Nothing Nothing
 
 prop_not_null_constraint :: Property
 prop_not_null_constraint = withTests 1 $ property $ do
@@ -194,8 +205,48 @@ prop_err_unterminated_string = withTests 1 $ property $ do
   _ <- expectLeft $ parseSQL "INSERT INTO t (x) VALUES ('hello)"
   success
 
+-- ORDER BY / LIMIT / OFFSET tests
+
+prop_order_by_single :: Property
+prop_order_by_single = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT * FROM t ORDER BY x"
+  stmt === Select [Star] "t" Nothing [OrderByClause "x" Asc] Nothing Nothing
+
+prop_order_by_desc :: Property
+prop_order_by_desc = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT * FROM t ORDER BY x DESC"
+  stmt === Select [Star] "t" Nothing [OrderByClause "x" Desc] Nothing Nothing
+
+prop_order_by_multi :: Property
+prop_order_by_multi = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT * FROM t ORDER BY x DESC, y ASC"
+  stmt === Select [Star] "t" Nothing
+    [OrderByClause "x" Desc, OrderByClause "y" Asc] Nothing Nothing
+
+prop_limit :: Property
+prop_limit = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT * FROM t LIMIT 10"
+  stmt === Select [Star] "t" Nothing [] (Just 10) Nothing
+
+prop_limit_offset :: Property
+prop_limit_offset = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT * FROM t LIMIT 10 OFFSET 5"
+  stmt === Select [Star] "t" Nothing [] (Just 10) (Just 5)
+
+prop_order_by_limit :: Property
+prop_order_by_limit = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT * FROM t ORDER BY x LIMIT 5"
+  stmt === Select [Star] "t" Nothing [OrderByClause "x" Asc] (Just 5) Nothing
+
+prop_where_order_limit_offset :: Property
+prop_where_order_limit_offset = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT * FROM t WHERE x > 0 ORDER BY x DESC LIMIT 10 OFFSET 2"
+  stmt === Select [Star] "t"
+    (Just (ExprBinOp OpGt (ExprColumn "x") (ExprLit (LitInt 0))))
+    [OrderByClause "x" Desc] (Just 10) (Just 2)
+
 -- This should parse fine (column resolution is at execution time, not parse time)
 prop_select_nonexistent_column_parses :: Property
 prop_select_nonexistent_column_parses = withTests 1 $ property $ do
   stmt <- expectRight $ parseSQL "SELECT nonexistent FROM t"
-  stmt === Select [Column "nonexistent"] "t" Nothing
+  stmt === Select [Column "nonexistent"] "t" Nothing [] Nothing Nothing

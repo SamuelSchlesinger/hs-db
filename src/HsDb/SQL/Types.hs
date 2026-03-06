@@ -7,6 +7,8 @@ module HsDb.SQL.Types
   , ColumnDef(..)
   , Literal(..)
   , SelectTarget(..)
+  , SortOrder(..)
+  , OrderByClause(..)
   ) where
 
 import Data.Text (Text)
@@ -19,18 +21,28 @@ data Statement
     -- ^ @DROP TABLE name@
   | Insert !Text [Text] [[Literal]]
     -- ^ table, column names, rows of values
-  | Select [SelectTarget] !Text (Maybe Expr)
-    -- ^ columns (or star), table, optional WHERE
+  | Select [SelectTarget] !Text (Maybe Expr) [OrderByClause] (Maybe Int) (Maybe Int)
+    -- ^ columns (or star), table, WHERE, ORDER BY, LIMIT, OFFSET
   | Update !Text [(Text, Expr)] (Maybe Expr)
     -- ^ table, SET assignments, optional WHERE
   | Delete !Text (Maybe Expr)
     -- ^ table, optional WHERE
+  | Begin
+  | Commit
+  | Rollback
   deriving (Show, Eq)
 
 -- | What columns a SELECT targets.
 data SelectTarget
   = Star
   | Column !Text
+  deriving (Show, Eq)
+
+-- | Sort order for ORDER BY clauses.
+data SortOrder = Asc | Desc deriving (Show, Eq)
+
+-- | A single ORDER BY clause: column name and sort direction.
+data OrderByClause = OrderByClause !Text !SortOrder
   deriving (Show, Eq)
 
 -- | SQL column definition in CREATE TABLE.
