@@ -10,6 +10,9 @@ import qualified Test.HsDb.Integration as Integration
 import qualified Test.HsDb.SQL.Parser as Parser
 import qualified Test.HsDb.SQL.Execute as Execute
 import qualified Test.HsDb.Checkpoint as Checkpoint
+import qualified Test.HsDb.Server as Server
+import qualified Test.HsDb.Logging as Logging
+import qualified Test.HsDb.Transaction as Transaction
 
 main :: IO ()
 main = do
@@ -21,6 +24,9 @@ main = do
     , checkParallel Parser.parserTests
     , checkParallel Execute.executeTests
     , checkParallel Checkpoint.checkpointTests
+    , checkParallel Server.serverTests
+    , checkParallel Logging.loggingTests
+    , checkParallel Transaction.transactionTests
     ]
   if and results
     then exitSuccess

@@ -71,6 +71,9 @@ test-suite hs-db-test
         Test.HsDb.SQL.Parser
         Test.HsDb.SQL.Execute
         Test.HsDb.Checkpoint
+        Test.HsDb.Server
+        Test.HsDb.Logging
+        Test.HsDb.Transaction
     build-depends:
         base ^>=4.18.3.0,
         hs-db,
@@ -84,6 +87,8 @@ test-suite hs-db-test
         temporary,
         directory,
         filepath,
-        transformers
+        transformers,
+        network
+    ghc-options:      -threaded -rtsopts
     hs-source-dirs:   test
     default-language: Haskell2010
