@@ -10,6 +10,7 @@ module HsDb.SQL.Parser
 import Data.Char (isAlphaNum, isAlpha, isDigit, isSpace)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Read as TR
 
 import HsDb.SQL.Types
 
@@ -105,8 +106,8 @@ pCommaSep p s0 = do
     go acc s = case pSymbol ',' s of
       Right ((), s') -> do
         (x, s'') <- p s'
-        go (acc ++ [x]) s''
-      Left _ -> Right (acc, s)
+        go (x : acc) s''
+      Left _ -> Right (reverse acc, s)
 
 -- Parse an identifier (unquoted or double-quoted).
 pIdentifier :: Parser Text
@@ -285,13 +286,15 @@ pNumLit s0 = do
           let (frac, rest'') = T.span isDigit rest'
           let s3 = s2 { psInput = rest'', psPos = psPos s2 + 1 + T.length frac }
               numStr = (if neg then "-" else "") <> digits <> "." <> frac
-          case reads (T.unpack numStr) of
-            [(d, "")] -> Right (LitFloat d, s3)
+          case TR.double numStr of
+            Right (d, leftover) | T.null leftover -> Right (LitFloat d, s3)
             _         -> pFail ("Invalid number: " <> numStr) s0
-        _ -> do
-          let n = read (T.unpack digits)
-              val = if neg then negate n else n
-          Right (LitInt val, s2)
+        _ ->
+          case TR.decimal digits of
+            Right (n, leftover) | T.null leftover ->
+              let val = if neg then negate n else n
+              in Right (LitInt val, s2)
+            _ -> pFail ("Invalid number: " <> digits) s0
 
 -- SELECT cols FROM table [WHERE expr]
 pSelect :: Parser Statement

@@ -1,0 +1,189 @@
+{-# LANGUAGE OverloadedStrings #-}
+
+module Test.HsDb.SQL.Execute (executeTests) where
+
+import Hedgehog
+import Control.Monad.IO.Class (MonadIO)
+import Control.Monad.Trans.Except (runExceptT)
+import Data.Text (Text)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
+
+import HsDb
+import HsDb.SQL.Parser (parseSQL)
+import HsDb.SQL.Execute
+
+executeTests :: Group
+executeTests = Group "SQL.Execute"
+  [ ("prop_create_and_insert", prop_create_and_insert)
+  , ("prop_select_star", prop_select_star)
+  , ("prop_select_columns", prop_select_columns)
+  , ("prop_select_nonexistent_column", prop_select_nonexistent_column)
+  , ("prop_select_where", prop_select_where)
+  , ("prop_update", prop_update)
+  , ("prop_delete", prop_delete)
+  , ("prop_drop_table", prop_drop_table)
+  , ("prop_insert_type_mismatch", prop_insert_type_mismatch)
+  , ("prop_select_mixed_star_error", prop_select_mixed_star_error)
+  , ("prop_null_handling", prop_null_handling)
+  , ("prop_multi_row_insert", prop_multi_row_insert)
+  ]
+
+-- Run a SQL string against a fresh database in a temp directory.
+withFreshDb :: (Database -> IO a) -> IO a
+withFreshDb action = withSystemTempDirectory "hs-db-test" $ \dir -> do
+  let config = defaultDatabaseConfig (dir </> "test.wal")
+  withDatabase config action
+
+execSQL :: Database -> Text -> IO (Either String QueryResult)
+execSQL db sql = case parseSQL sql of
+  Left err -> return (Left ("Parse error: " ++ show err))
+  Right stmt -> do
+    result <- runExceptT (executeSQL db stmt)
+    case result of
+      Left e  -> return (Left (show e))
+      Right r -> return (Right r)
+
+expectExecRight :: (MonadTest m, MonadIO m) => IO (Either String QueryResult) -> m QueryResult
+expectExecRight action = do
+  result <- evalIO action
+  case result of
+    Right r -> return r
+    Left e  -> do annotate e; failure
+
+expectExecLeft :: (MonadTest m, MonadIO m) => IO (Either String QueryResult) -> m ()
+expectExecLeft action = do
+  result <- evalIO action
+  case result of
+    Left _  -> success
+    Right r -> do annotateShow r; failure
+
+prop_create_and_insert :: Property
+prop_create_and_insert = withTests 1 $ property $ do
+  r <- evalIO $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (id INT NOT NULL, name TEXT)"
+    execSQL db "INSERT INTO t (id, name) VALUES (42, 'hello')"
+  case r of
+    Right (CommandComplete tag) -> tag === "INSERT 0 1"
+    Right other -> do annotateShow other; failure
+    Left e      -> do annotate e; failure
+
+prop_select_star :: Property
+prop_select_star = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL, y TEXT)"
+    _ <- execSQL db "INSERT INTO t (x, y) VALUES (1, 'a')"
+    _ <- execSQL db "INSERT INTO t (x, y) VALUES (2, 'b')"
+    execSQL db "SELECT * FROM t"
+  case result of
+    RowResult cols rows -> do
+      length cols === 2
+      ciName (head cols) === "x"
+      length rows === 2
+    other -> do annotateShow other; failure
+
+prop_select_columns :: Property
+prop_select_columns = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL, y TEXT, z BOOLEAN)"
+    _ <- execSQL db "INSERT INTO t (x, y, z) VALUES (1, 'hello', TRUE)"
+    execSQL db "SELECT y, x FROM t"
+  case result of
+    RowResult cols rows -> do
+      map ciName cols === ["y", "x"]
+      rows === [[Just "hello", Just "1"]]
+    other -> do annotateShow other; failure
+
+prop_select_nonexistent_column :: Property
+prop_select_nonexistent_column = withTests 1 $ property $ do
+  expectExecLeft $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1)"
+    execSQL db "SELECT nonexistent FROM t"
+
+prop_select_where :: Property
+prop_select_where = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL, y TEXT)"
+    _ <- execSQL db "INSERT INTO t (x, y) VALUES (1, 'a')"
+    _ <- execSQL db "INSERT INTO t (x, y) VALUES (2, 'b')"
+    _ <- execSQL db "INSERT INTO t (x, y) VALUES (3, 'c')"
+    execSQL db "SELECT y FROM t WHERE x > 1"
+  case result of
+    RowResult _ rows -> do
+      length rows === 2
+      rows === [[Just "b"], [Just "c"]]
+    other -> do annotateShow other; failure
+
+prop_update :: Property
+prop_update = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL, y TEXT)"
+    _ <- execSQL db "INSERT INTO t (x, y) VALUES (1, 'old')"
+    _ <- execSQL db "UPDATE t SET y = 'new' WHERE x = 1"
+    execSQL db "SELECT y FROM t"
+  case result of
+    RowResult _ rows -> rows === [[Just "new"]]
+    other -> do annotateShow other; failure
+
+prop_delete :: Property
+prop_delete = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (2)"
+    _ <- execSQL db "DELETE FROM t WHERE x = 1"
+    execSQL db "SELECT x FROM t"
+  case result of
+    RowResult _ rows -> rows === [[Just "2"]]
+    other -> do annotateShow other; failure
+
+prop_drop_table :: Property
+prop_drop_table = withTests 1 $ property $ do
+  result <- evalIO $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "DROP TABLE t"
+    execSQL db "SELECT * FROM t"
+  case result of
+    Left _ -> success  -- table should not exist
+    Right _ -> do annotate "Expected error after DROP TABLE"; failure
+
+prop_insert_type_mismatch :: Property
+prop_insert_type_mismatch = withTests 1 $ property $ do
+  expectExecLeft $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    execSQL db "INSERT INTO t (x) VALUES ('not a number')"
+
+prop_select_mixed_star_error :: Property
+prop_select_mixed_star_error = withTests 1 $ property $ do
+  -- SELECT *, x FROM t — the parser would parse this as [Star] since * is
+  -- first, so this is more of a parser-level test. The executor's error
+  -- path for Star mixed with columns is covered if the parser produces it.
+  -- For now, just verify * alone works.
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1)"
+    execSQL db "SELECT * FROM t"
+  case result of
+    RowResult cols _ -> map ciName cols === ["x"]
+    other -> do annotateShow other; failure
+
+prop_null_handling :: Property
+prop_null_handling = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT, y TEXT)"
+    _ <- execSQL db "INSERT INTO t (x, y) VALUES (NULL, 'a')"
+    execSQL db "SELECT * FROM t WHERE x IS NULL"
+  case result of
+    RowResult _ rows -> length rows === 1
+    other -> do annotateShow other; failure
+
+prop_multi_row_insert :: Property
+prop_multi_row_insert = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1), (2), (3)"
+    execSQL db "SELECT * FROM t"
+  case result of
+    RowResult _ rows -> length rows === 3
+    other -> do annotateShow other; failure

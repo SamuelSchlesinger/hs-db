@@ -7,6 +7,8 @@ import qualified Test.HsDb.Table as Table
 import qualified Test.HsDb.WAL.Serialize as Serialize
 import qualified Test.HsDb.WAL.Replay as Replay
 import qualified Test.HsDb.Integration as Integration
+import qualified Test.HsDb.SQL.Parser as Parser
+import qualified Test.HsDb.SQL.Execute as Execute
 
 main :: IO ()
 main = do
@@ -15,6 +17,8 @@ main = do
     , checkParallel Serialize.serializeTests
     , checkParallel Replay.replayTests
     , checkParallel Integration.integrationTests
+    , checkParallel Parser.parserTests
+    , checkParallel Execute.executeTests
     ]
   if and results
     then exitSuccess

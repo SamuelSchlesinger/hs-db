@@ -65,6 +65,8 @@ test-suite hs-db-test
         Test.HsDb.WAL.Serialize
         Test.HsDb.WAL.Replay
         Test.HsDb.Integration
+        Test.HsDb.SQL.Parser
+        Test.HsDb.SQL.Execute
     build-depends:
         base ^>=4.18.3.0,
         hs-db,

@@ -74,14 +74,17 @@ readExact h ref n = do
             then fail "Connection closed"
             else go (acc <> chunk) remaining
 
--- Parse a 32-bit big-endian integer from bytes
+-- Parse a 32-bit big-endian integer from bytes.
+-- Caller must ensure ByteString has at least 4 bytes (readExact guarantees this).
 getInt32 :: ByteString -> Int
-getInt32 bs =
-  let b0 = fromIntegral (BS.index bs 0) :: Int
-      b1 = fromIntegral (BS.index bs 1) :: Int
-      b2 = fromIntegral (BS.index bs 2) :: Int
-      b3 = fromIntegral (BS.index bs 3) :: Int
-  in (b0 `shiftL` 24) .|. (b1 `shiftL` 16) .|. (b2 `shiftL` 8) .|. b3
+getInt32 bs
+  | BS.length bs < 4 = error "getInt32: ByteString too short (need 4 bytes)"
+  | otherwise =
+      let b0 = fromIntegral (BS.index bs 0) :: Int
+          b1 = fromIntegral (BS.index bs 1) :: Int
+          b2 = fromIntegral (BS.index bs 2) :: Int
+          b3 = fromIntegral (BS.index bs 3) :: Int
+      in (b0 `shiftL` 24) .|. (b1 `shiftL` 16) .|. (b2 `shiftL` 8) .|. b3
 
 -- | Read the initial startup message (no type byte, just length + payload).
 -- Returns the parsed message and a ReadState for subsequent reads.

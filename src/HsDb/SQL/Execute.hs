@@ -95,7 +95,7 @@ execSelect :: Database -> Text -> [SelectTarget] -> Maybe Expr
 execSelect db name targets wh = do
   schema <- getTableSchema (dbCatalog db) name
   rows <- atomicallyDbError $ selectAllSTM db name
-  let (colInfos, colIdxs) = resolveSelectTargets schema targets
+  (colInfos, colIdxs) <- except $ resolveSelectTargets schema targets
   let filtered = case wh of
         Nothing -> rows
         Just expr -> filter (\(_, row) -> evalWhere schema expr row) rows
@@ -205,21 +205,22 @@ literalToValue TBool (LitBool b)   = Right (VBool b)
 literalToValue ty lit              = Left ("Cannot convert " <> T.pack (show lit)
                                            <> " to " <> T.pack (show ty))
 
-resolveSelectTargets :: Schema -> [SelectTarget] -> ([ColumnInfo], [Int])
+resolveSelectTargets :: Schema -> [SelectTarget] -> Either Text ([ColumnInfo], [Int])
 resolveSelectTargets schema [Star] =
   let infos = map (\c -> ColumnInfo (columnName c) (columnType c)) schema
       idxs  = [0 .. length schema - 1]
-  in (infos, idxs)
+  in Right (infos, idxs)
 resolveSelectTargets schema targets =
-  let resolve (SQL.Column col) =
+  let indexed = zip (map columnName schema) [0..]
+      resolve (SQL.Column col) =
         case lookup col indexed of
           Just i  -> let c = schema !! i
-                     in (ColumnInfo (columnName c) (columnType c), i)
-          Nothing -> (ColumnInfo col TText, -1) -- will produce empty
-        where indexed = zip (map columnName schema) [0..]
-      resolve Star = error "unexpected Star in non-star target list"
-      pairs = map resolve targets
-  in (map fst pairs, map snd pairs)
+                     in Right (ColumnInfo (columnName c) (columnType c), i)
+          Nothing -> Left ("Column '" <> col <> "' does not exist in table")
+      resolve Star = Left "* cannot be mixed with column names"
+  in do
+      pairs <- mapM resolve targets
+      return (map fst pairs, map snd pairs)
 
 projectRow :: [Int] -> Row -> [Value]
 projectRow idxs row = map (\i -> row V.! i) idxs
@@ -278,7 +279,7 @@ evalBinOp _ _ _     = VNull
 valEq :: Value -> Value -> Bool
 valEq VNull _ = False
 valEq _ VNull = False
-valEq a b     = a == b
+valEq a b     = valCmp a b == Just EQ
 
 valCmp :: Value -> Value -> Maybe Ordering
 valCmp (VInt32 a)   (VInt32 b)   = Just (compare a b)

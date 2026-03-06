@@ -2,6 +2,7 @@
 -- the database, and starts the PostgreSQL-protocol TCP server.
 module Main (main) where
 
+import Data.Char (isDigit)
 import System.Directory (createDirectoryIfMissing)
 import System.Environment (getArgs)
 import System.FilePath ((</>))
@@ -26,9 +27,16 @@ main = do
 parseArgs :: [String] -> ServerConfig -> String -> Either String (ServerConfig, String)
 parseArgs [] cfg dir = Right (cfg, dir)
 parseArgs ("--host":h:rest) cfg dir = parseArgs rest (cfg { serverHost = h }) dir
-parseArgs ("--port":p:rest) cfg dir = parseArgs rest (cfg { serverPort = p }) dir
+parseArgs ("--port":p:rest) cfg dir
+  | all isDigit p, not (null p)
+  , let n = read p :: Int, n > 0 && n <= 65535
+  = parseArgs rest (cfg { serverPort = p }) dir
+  | otherwise = Left ("Invalid port: " ++ p ++ " (must be 1-65535)")
 parseArgs ("--data-dir":d:rest) cfg _ = parseArgs rest cfg d
 parseArgs ("--help":_) _ _ = Left helpText
+parseArgs [flag] _ _
+  | flag `elem` ["--host", "--port", "--data-dir"]
+  = Left ("Missing value for " ++ flag)
 parseArgs (unknown:_) _ _ = Left ("Unknown option: " ++ unknown)
 
 helpText :: String

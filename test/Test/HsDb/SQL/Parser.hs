@@ -1,0 +1,201 @@
+{-# LANGUAGE OverloadedStrings #-}
+
+module Test.HsDb.SQL.Parser (parserTests) where
+
+import Hedgehog
+import HsDb.SQL.Parser
+import HsDb.SQL.Types as SQL
+
+parserTests :: Group
+parserTests = Group "SQL.Parser"
+  [ ("prop_create_table", prop_create_table)
+  , ("prop_drop_table", prop_drop_table)
+  , ("prop_insert_single", prop_insert_single)
+  , ("prop_insert_multi_row", prop_insert_multi_row)
+  , ("prop_select_star", prop_select_star)
+  , ("prop_select_columns", prop_select_columns)
+  , ("prop_select_where", prop_select_where)
+  , ("prop_update_set", prop_update_set)
+  , ("prop_delete", prop_delete)
+  , ("prop_case_insensitive", prop_case_insensitive)
+  , ("prop_where_and_or", prop_where_and_or)
+  , ("prop_where_is_null", prop_where_is_null)
+  , ("prop_where_is_not_null", prop_where_is_not_null)
+  , ("prop_comparison_ops", prop_comparison_ops)
+  , ("prop_string_escape", prop_string_escape)
+  , ("prop_negative_number", prop_negative_number)
+  , ("prop_float_literal", prop_float_literal)
+  , ("prop_quoted_identifier", prop_quoted_identifier)
+  , ("prop_not_null_constraint", prop_not_null_constraint)
+  , ("prop_trailing_semicolon", prop_trailing_semicolon)
+  , ("prop_err_empty_input", prop_err_empty_input)
+  , ("prop_err_unknown_type", prop_err_unknown_type)
+  , ("prop_err_reserved_as_ident", prop_err_reserved_as_ident)
+  , ("prop_err_missing_from", prop_err_missing_from)
+  , ("prop_err_unterminated_string", prop_err_unterminated_string)
+  , ("prop_select_nonexistent_column_parses", prop_select_nonexistent_column_parses)
+  ]
+
+expectRight :: (MonadTest m, Show a) => Either ParseError a -> m a
+expectRight (Right a) = return a
+expectRight (Left e)  = do annotateShow e; failure
+
+expectLeft :: (MonadTest m, Show a) => Either ParseError a -> m ParseError
+expectLeft (Left e)  = return e
+expectLeft (Right a) = do annotateShow a; failure
+
+prop_create_table :: Property
+prop_create_table = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "CREATE TABLE users (id INT NOT NULL, name TEXT)"
+  stmt === CreateTable "users"
+    [ ColumnDef "id" SqlInt False
+    , ColumnDef "name" SqlText True
+    ]
+
+prop_drop_table :: Property
+prop_drop_table = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "DROP TABLE users"
+  stmt === DropTable "users"
+
+prop_insert_single :: Property
+prop_insert_single = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "INSERT INTO users (id, name) VALUES (1, 'hello')"
+  stmt === Insert "users" ["id", "name"] [[LitInt 1, LitText "hello"]]
+
+prop_insert_multi_row :: Property
+prop_insert_multi_row = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL
+    "INSERT INTO t (x) VALUES (1), (2), (3)"
+  stmt === Insert "t" ["x"] [[LitInt 1], [LitInt 2], [LitInt 3]]
+
+prop_select_star :: Property
+prop_select_star = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT * FROM users"
+  stmt === Select [Star] "users" Nothing
+
+prop_select_columns :: Property
+prop_select_columns = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT id, name FROM users"
+  stmt === Select [Column "id", Column "name"] "users" Nothing
+
+prop_select_where :: Property
+prop_select_where = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT * FROM users WHERE id = 1"
+  stmt === Select [Star] "users"
+    (Just (ExprBinOp OpEq (ExprColumn "id") (ExprLit (LitInt 1))))
+
+prop_update_set :: Property
+prop_update_set = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "UPDATE users SET name = 'bob' WHERE id = 1"
+  stmt === SQL.Update "users"
+    [("name", ExprLit (LitText "bob"))]
+    (Just (ExprBinOp OpEq (ExprColumn "id") (ExprLit (LitInt 1))))
+
+prop_delete :: Property
+prop_delete = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "DELETE FROM users WHERE id = 1"
+  stmt === SQL.Delete "users"
+    (Just (ExprBinOp OpEq (ExprColumn "id") (ExprLit (LitInt 1))))
+
+prop_case_insensitive :: Property
+prop_case_insensitive = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "select * from USERS"
+  stmt === Select [Star] "users" Nothing
+
+prop_where_and_or :: Property
+prop_where_and_or = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT * FROM t WHERE a = 1 AND b = 2 OR c = 3"
+  -- OR has lower precedence than AND: (a=1 AND b=2) OR (c=3)
+  stmt === Select [Star] "t" (Just
+    (ExprBinOp OpOr
+      (ExprBinOp OpAnd
+        (ExprBinOp OpEq (ExprColumn "a") (ExprLit (LitInt 1)))
+        (ExprBinOp OpEq (ExprColumn "b") (ExprLit (LitInt 2))))
+      (ExprBinOp OpEq (ExprColumn "c") (ExprLit (LitInt 3)))))
+
+prop_where_is_null :: Property
+prop_where_is_null = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT * FROM t WHERE x IS NULL"
+  stmt === Select [Star] "t" (Just (ExprIsNull (ExprColumn "x")))
+
+prop_where_is_not_null :: Property
+prop_where_is_not_null = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT * FROM t WHERE x IS NOT NULL"
+  stmt === Select [Star] "t" (Just (ExprIsNotNull (ExprColumn "x")))
+
+prop_comparison_ops :: Property
+prop_comparison_ops = withTests 1 $ property $ do
+  _ <- expectRight $ parseSQL "SELECT * FROM t WHERE x < 1"
+  _ <- expectRight $ parseSQL "SELECT * FROM t WHERE x > 1"
+  _ <- expectRight $ parseSQL "SELECT * FROM t WHERE x <= 1"
+  _ <- expectRight $ parseSQL "SELECT * FROM t WHERE x >= 1"
+  _ <- expectRight $ parseSQL "SELECT * FROM t WHERE x <> 1"
+  _ <- expectRight $ parseSQL "SELECT * FROM t WHERE x != 1"
+  success
+
+prop_string_escape :: Property
+prop_string_escape = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "INSERT INTO t (x) VALUES ('it''s')"
+  stmt === Insert "t" ["x"] [[LitText "it's"]]
+
+prop_negative_number :: Property
+prop_negative_number = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "INSERT INTO t (x) VALUES (-42)"
+  stmt === Insert "t" ["x"] [[LitInt (-42)]]
+
+prop_float_literal :: Property
+prop_float_literal = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "INSERT INTO t (x) VALUES (3.14)"
+  stmt === Insert "t" ["x"] [[LitFloat 3.14]]
+
+prop_quoted_identifier :: Property
+prop_quoted_identifier = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT \"select\" FROM t"
+  stmt === Select [Column "select"] "t" Nothing
+
+prop_not_null_constraint :: Property
+prop_not_null_constraint = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "CREATE TABLE t (x INT NOT NULL, y TEXT)"
+  stmt === CreateTable "t"
+    [ ColumnDef "x" SqlInt False
+    , ColumnDef "y" SqlText True
+    ]
+
+prop_trailing_semicolon :: Property
+prop_trailing_semicolon = withTests 1 $ property $ do
+  -- Semicolons are not part of our grammar; they should cause a parse error
+  _ <- expectLeft $ parseSQL "SELECT * FROM t;"
+  success
+
+-- Negative tests
+
+prop_err_empty_input :: Property
+prop_err_empty_input = withTests 1 $ property $ do
+  _ <- expectLeft $ parseSQL ""
+  success
+
+prop_err_unknown_type :: Property
+prop_err_unknown_type = withTests 1 $ property $ do
+  _ <- expectLeft $ parseSQL "CREATE TABLE t (x DATETIME)"
+  success
+
+prop_err_reserved_as_ident :: Property
+prop_err_reserved_as_ident = withTests 1 $ property $ do
+  _ <- expectLeft $ parseSQL "CREATE TABLE select (x INT)"
+  success
+
+prop_err_missing_from :: Property
+prop_err_missing_from = withTests 1 $ property $ do
+  _ <- expectLeft $ parseSQL "SELECT * users"
+  success
+
+prop_err_unterminated_string :: Property
+prop_err_unterminated_string = withTests 1 $ property $ do
+  _ <- expectLeft $ parseSQL "INSERT INTO t (x) VALUES ('hello)"
+  success
+
+-- This should parse fine (column resolution is at execution time, not parse time)
+prop_select_nonexistent_column_parses :: Property
+prop_select_nonexistent_column_parses = withTests 1 $ property $ do
+  stmt <- expectRight $ parseSQL "SELECT nonexistent FROM t"
+  stmt === Select [Column "nonexistent"] "t" Nothing

@@ -25,6 +25,7 @@ import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Vector (Vector)
@@ -55,8 +56,10 @@ lookupTable catalog name = do
     Just table -> return table
 
 -- | Create a new table in the catalog.
+-- Rejects schemas with duplicate column names.
 createTable :: TableCatalog -> TableName -> Schema -> ExceptT DbError STM Table
 createTable catalog name schema = do
+  checkDuplicateColumns schema
   tables <- lift $ readTVar catalog
   case Map.lookup name tables of
     Just _  -> throwE (TableAlreadyExists name)
@@ -66,6 +69,16 @@ createTable catalog name schema = do
       let table = Table schema rows counter
       lift $ writeTVar catalog (Map.insert name table tables)
       return table
+
+-- | Check that no two columns share the same name.
+checkDuplicateColumns :: Schema -> ExceptT DbError STM ()
+checkDuplicateColumns = go Set.empty
+  where
+    go _ [] = return ()
+    go seen (col:cols)
+      | Set.member (columnName col) seen =
+          throwE (SchemaViolation ("Duplicate column name: " <> columnName col))
+      | otherwise = go (Set.insert (columnName col) seen) cols
 
 -- | Drop a table from the catalog.
 dropTable :: TableCatalog -> TableName -> ExceptT DbError STM ()
