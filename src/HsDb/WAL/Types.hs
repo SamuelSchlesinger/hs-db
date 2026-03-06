@@ -20,15 +20,16 @@ import Data.Time (UTCTime)
 import Data.Vector (Vector)
 import Data.Word (Word64)
 
-import HsDb.Types (Column, Value, RowId)
+import HsDb.Types (Value, RowId, Schema, Column)
 
 -- | Commands that can be recorded in the WAL.
 data WALCommand
-  = CmdCreateTable !Text ![Column]
+  = CmdCreateTable !Text !Schema
   | CmdInsertRow !Text !RowId !(Vector Value)
   | CmdUpdateRow !Text !RowId !(Vector Value)
   | CmdDeleteRow !Text !RowId
   | CmdDropTable !Text
+  | CmdAlterAddColumn !Text !Column
   deriving (Show, Eq)
 
 -- | A WAL entry with sequence number and timestamp, assigned by the flusher.

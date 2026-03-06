@@ -1,6 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ForeignFunctionInterface #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | WAL writer and flusher thread. Opens the WAL file, assigns sequence
 -- numbers, batches writes, fsyncs to disk, and signals durability callbacks.
@@ -14,30 +12,19 @@ module HsDb.WAL.Writer
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch, finally, throwIO)
-import Control.Monad (when)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time.Clock (getCurrentTime)
 import Data.Word (Word64)
-import Foreign.C.Types (CInt(..))
-import System.IO.Error (mkIOError, illegalOperationErrorType)
 import System.IO (Handle, hFlush, IOMode(..), openBinaryFile, hClose, hFileSize, SeekMode(..), hSeek)
 import System.Posix.IO (openFd, closeFd, defaultFileFlags, OpenMode(..))
 import System.Posix.Types (Fd(..))
 
+import HsDb.IO (fsyncFd)
 import HsDb.WAL.Types
 import HsDb.WAL.Serialize
-
--- POSIX fsync via FFI
-foreign import ccall "fsync" c_fsync :: CInt -> IO CInt
-
-fsyncFd :: Fd -> IO ()
-fsyncFd (Fd fd) = do
-  result <- c_fsync fd
-  when (result /= 0) $
-    throwIO (mkIOError illegalOperationErrorType "fsync failed" Nothing Nothing)
 
 -- | Handle to an open WAL file, with the queue and state.
 data WALHandle = WALHandle

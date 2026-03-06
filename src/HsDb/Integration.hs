@@ -11,6 +11,7 @@ module HsDb.Integration
   , deleteRowSTM
   , dropTableSTM
   , selectAllSTM
+  , alterAddColumnSTM
   , atomicallyE
   , commitPendingOps
   ) where
@@ -22,7 +23,9 @@ import Control.Monad.Trans.Except (ExceptT(..), throwE, runExceptT)
 import Data.Vector (Vector)
 
 import HsDb.Types
-import HsDb.Table
+import HsDb.Table (Table(..), TableCatalog, createTable, dropTable, insertRow,
+                    selectAll, updateRow, deleteRow, lookupTable,
+                    alterAddColumn)
 import HsDb.WAL.Types
 import HsDb.WAL.Writer (WALHandle)
 import HsDb.Transaction (PendingOp(..))
@@ -108,6 +111,16 @@ selectAllSTM db name = do
   table <- lookupTable (dbCatalog db) name
   lift $ selectAll table
 
+-- | Add a column to a table and enqueue the WAL command.
+alterAddColumnSTM :: Database -> TableName -> Column
+                  -> ExceptT DbError STM (TMVar ())
+alterAddColumnSTM db name col = do
+  checkWritable db
+  alterAddColumn (dbCatalog db) name col
+  callback <- lift newEmptyTMVar
+  lift $ writeTBQueue (dbQueue db) (CmdAlterAddColumn name col, callback)
+  return callback
+
 -- | Commit a list of pending ops in a single STM transaction.
 -- Returns the last callback (waiting on it guarantees all prior entries are durable).
 commitPendingOps :: Database -> [PendingOp] -> ExceptT DbError STM [TMVar ()]
@@ -143,4 +156,9 @@ commitOp db (PendingDrop name) = do
   dropTable (dbCatalog db) name
   callback <- lift newEmptyTMVar
   lift $ writeTBQueue (dbQueue db) (CmdDropTable name, callback)
+  return callback
+commitOp db (PendingAlterAddColumn name col) = do
+  alterAddColumn (dbCatalog db) name col
+  callback <- lift newEmptyTMVar
+  lift $ writeTBQueue (dbQueue db) (CmdAlterAddColumn name col, callback)
   return callback

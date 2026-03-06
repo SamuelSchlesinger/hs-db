@@ -15,6 +15,7 @@ module HsDb.Table
   , deleteRow
   , validateRow
   , lookupTable
+  , alterAddColumn
   ) where
 
 import Control.Concurrent.STM
@@ -72,13 +73,15 @@ createTable catalog name schema = do
 
 -- | Check that no two columns share the same name.
 checkDuplicateColumns :: Schema -> ExceptT DbError STM ()
-checkDuplicateColumns = go Set.empty
+checkDuplicateColumns schema = go Set.empty 0
   where
-    go _ [] = return ()
-    go seen (col:cols)
-      | Set.member (columnName col) seen =
-          throwE (SchemaViolation ("Duplicate column name: " <> columnName col))
-      | otherwise = go (Set.insert (columnName col) seen) cols
+    go seen i
+      | i >= V.length schema = return ()
+      | otherwise =
+          let col = schema V.! i
+          in if Set.member (columnName col) seen
+             then throwE (SchemaViolation ("Duplicate column name: " <> columnName col))
+             else go (Set.insert (columnName col) seen) (i + 1)
 
 -- | Drop a table from the catalog.
 dropTable :: TableCatalog -> TableName -> ExceptT DbError STM ()
@@ -92,20 +95,22 @@ dropTable catalog name = do
 -- description of the schema violation.
 validateRow :: Schema -> Vector Value -> Either DbError ()
 validateRow schema row
-  | V.length row /= length schema =
-      Left (SchemaViolation (T.pack ("Expected " ++ show (length schema)
+  | V.length row /= V.length schema =
+      Left (SchemaViolation (T.pack ("Expected " ++ show (V.length schema)
                                      ++ " columns, got " ++ show (V.length row))))
-  | otherwise = checkColumns 0 schema (V.toList row)
+  | otherwise = checkColumns 0
   where
-    checkColumns :: Int -> [Column] -> [Value] -> Either DbError ()
-    checkColumns _ [] [] = Right ()
-    checkColumns i (col:cols) (val:vals) =
-      case checkValue col val of
-        Nothing  -> checkColumns (i + 1) cols vals
-        Just err -> Left (SchemaViolation (T.pack ("Column " ++ show i
-                                                    ++ " (" ++ T.unpack (columnName col) ++ "): "
-                                                    ++ T.unpack err)))
-    checkColumns _ _ _ = Right () -- impossible given length check above
+    checkColumns :: Int -> Either DbError ()
+    checkColumns i
+      | i >= V.length schema = Right ()
+      | otherwise =
+          let col = schema V.! i
+              val = row V.! i
+          in case checkValue col val of
+               Nothing  -> checkColumns (i + 1)
+               Just err -> Left (SchemaViolation (T.pack ("Column " ++ show i
+                                                           ++ " (" ++ T.unpack (columnName col) ++ "): "
+                                                           ++ T.unpack err)))
 
     checkValue :: Column -> Value -> Maybe Text
     checkValue col VNull
@@ -181,3 +186,23 @@ deleteRow table tableName rowId = do
   case IntMap.lookup rowId rows of
     Nothing -> throwE (RowNotFound tableName rowId)
     Just _  -> lift $ writeTVar (tableRows table) (IntMap.delete rowId rows)
+
+-- | Add a column to a table's schema and backfill all existing rows with VNull.
+-- The new column must be nullable.
+alterAddColumn :: TableCatalog -> TableName -> Column -> ExceptT DbError STM ()
+alterAddColumn catalog name col = do
+  tables <- lift $ readTVar catalog
+  case Map.lookup name tables of
+    Nothing -> throwE (TableNotFound name)
+    Just table -> do
+      let schema = tableSchema table
+          colNames = [columnName (schema V.! i) | i <- [0..V.length schema - 1]]
+      if columnName col `elem` colNames
+        then throwE (SchemaViolation ("Duplicate column name: " <> columnName col))
+        else do
+          let newSchema = V.snoc schema col
+          rows <- lift $ readTVar (tableRows table)
+          let newRows = IntMap.map (`V.snoc` VNull) rows
+          lift $ writeTVar (tableRows table) newRows
+          let newTable = Table newSchema (tableRows table) (tableCounter table)
+          lift $ writeTVar catalog (Map.insert name newTable tables)

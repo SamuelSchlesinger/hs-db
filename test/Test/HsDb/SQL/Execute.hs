@@ -42,6 +42,18 @@ executeTests = Group "SQL.Execute"
   , ("prop_tx_select_sees_pending", prop_tx_select_sees_pending)
   , ("prop_tx_drop_rollback", prop_tx_drop_rollback)
   , ("prop_tx_abort_on_error", prop_tx_abort_on_error)
+  , ("prop_distinct", prop_distinct)
+  , ("prop_column_alias", prop_column_alias)
+  , ("prop_count_star", prop_count_star)
+  , ("prop_count_col", prop_count_col)
+  , ("prop_sum_avg", prop_sum_avg)
+  , ("prop_min_max", prop_min_max)
+  , ("prop_like", prop_like)
+  , ("prop_ilike", prop_ilike)
+  , ("prop_in_operator", prop_in_operator)
+  , ("prop_not_operator", prop_not_operator)
+  , ("prop_alter_add_column", prop_alter_add_column)
+  , ("prop_explain", prop_explain)
   ]
 
 -- Run a SQL string against a fresh database in a temp directory.
@@ -366,3 +378,142 @@ prop_tx_abort_on_error = withTests 1 $ property $ do
     Right (RowResult _ rows) -> length rows === 0  -- nothing committed
     Right other -> do annotateShow other; failure
     Left e -> do annotate e; failure
+
+-- Phase 8 feature tests
+
+prop_distinct :: Property
+prop_distinct = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1), (2), (1), (3), (2)"
+    execSQL db "SELECT DISTINCT x FROM t ORDER BY x"
+  case result of
+    RowResult _ rows -> rows === [[Just "1"], [Just "2"], [Just "3"]]
+    other -> do annotateShow other; failure
+
+prop_column_alias :: Property
+prop_column_alias = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (42)"
+    execSQL db "SELECT x AS val FROM t"
+  case result of
+    RowResult cols rows -> do
+      map ciName cols === ["val"]
+      rows === [[Just "42"]]
+    other -> do annotateShow other; failure
+
+prop_count_star :: Property
+prop_count_star = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1), (2), (3)"
+    execSQL db "SELECT COUNT(*) FROM t"
+  case result of
+    RowResult cols rows -> do
+      map ciName cols === ["count"]
+      rows === [[Just "3"]]
+    other -> do annotateShow other; failure
+
+prop_count_col :: Property
+prop_count_col = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1), (NULL), (3)"
+    execSQL db "SELECT COUNT(x) FROM t"
+  case result of
+    RowResult _ rows -> rows === [[Just "2"]]  -- NULL not counted
+    other -> do annotateShow other; failure
+
+prop_sum_avg :: Property
+prop_sum_avg = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (10), (20), (30)"
+    execSQL db "SELECT SUM(x) FROM t"
+  case result of
+    RowResult _ rows -> rows === [[Just "60"]]
+    other -> do annotateShow other; failure
+
+prop_min_max :: Property
+prop_min_max = withTests 1 $ property $ do
+  resultMin <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (3), (1), (2)"
+    execSQL db "SELECT MIN(x) FROM t"
+  case resultMin of
+    RowResult _ rows -> rows === [[Just "1"]]
+    other -> do annotateShow other; failure
+  resultMax <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (3), (1), (2)"
+    execSQL db "SELECT MAX(x) FROM t"
+  case resultMax of
+    RowResult _ rows -> rows === [[Just "3"]]
+    other -> do annotateShow other; failure
+
+prop_like :: Property
+prop_like = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (name TEXT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (name) VALUES ('hello'), ('world'), ('help')"
+    execSQL db "SELECT name FROM t WHERE name LIKE 'hel%' ORDER BY name"
+  case result of
+    RowResult _ rows -> rows === [[Just "hello"], [Just "help"]]
+    other -> do annotateShow other; failure
+
+prop_ilike :: Property
+prop_ilike = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (name TEXT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (name) VALUES ('Hello'), ('WORLD'), ('help')"
+    execSQL db "SELECT name FROM t WHERE name ILIKE 'hel%' ORDER BY name"
+  case result of
+    RowResult _ rows -> rows === [[Just "Hello"], [Just "help"]]
+    other -> do annotateShow other; failure
+
+prop_in_operator :: Property
+prop_in_operator = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1), (2), (3), (4), (5)"
+    execSQL db "SELECT x FROM t WHERE x IN (2, 4) ORDER BY x"
+  case result of
+    RowResult _ rows -> rows === [[Just "2"], [Just "4"]]
+    other -> do annotateShow other; failure
+
+prop_not_operator :: Property
+prop_not_operator = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x BOOLEAN NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (TRUE), (FALSE)"
+    execSQL db "SELECT x FROM t WHERE NOT x = TRUE"
+  case result of
+    RowResult _ rows -> rows === [[Just "f"]]
+    other -> do annotateShow other; failure
+
+prop_alter_add_column :: Property
+prop_alter_add_column = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1), (2)"
+    _ <- execSQL db "ALTER TABLE t ADD COLUMN y TEXT"
+    _ <- execSQL db "UPDATE t SET y = 'hello' WHERE x = 1"
+    execSQL db "SELECT x, y FROM t ORDER BY x"
+  case result of
+    RowResult cols rows -> do
+      map ciName cols === ["x", "y"]
+      rows === [[Just "1", Just "hello"], [Just "2", Nothing]]
+    other -> do annotateShow other; failure
+
+prop_explain :: Property
+prop_explain = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    execSQL db "EXPLAIN SELECT * FROM t WHERE x > 0 ORDER BY x LIMIT 10"
+  case result of
+    RowResult cols rows -> do
+      map ciName cols === ["QUERY PLAN"]
+      -- Should have multiple plan lines
+      assert (length rows >= 2)
+    other -> do annotateShow other; failure

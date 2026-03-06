@@ -32,7 +32,12 @@ genColumn = Column
   <*> Gen.bool
 
 genSchema :: Gen Schema
-genSchema = Gen.list (Range.linear 1 8) genColumn
+genSchema = do
+  n <- Gen.int (Range.linear 1 8)
+  V.fromList <$> traverse genColumnN [1..n]
+  where
+    genColumnN :: Int -> Gen Column
+    genColumnN i = Column ("c" <> T.pack (show i)) <$> genColumnType <*> Gen.bool
 
 genValueForType :: Column -> Gen Value
 genValueForType col = do
@@ -48,7 +53,7 @@ genValueForType col = do
     else gen
 
 genRowForSchema :: Schema -> Gen Row
-genRowForSchema schema = V.fromList <$> traverse genValueForType schema
+genRowForSchema schema = V.fromList <$> traverse genValueForType (V.toList schema)
 
 genValue :: Gen Value
 genValue = Gen.choice

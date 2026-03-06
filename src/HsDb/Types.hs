@@ -52,8 +52,8 @@ data Column = Column
   , columnNullable :: !Bool
   } deriving (Show, Eq)
 
--- | A schema is a list of column definitions.
-type Schema = [Column]
+-- | A schema is a vector of column definitions, indexed by column position.
+type Schema = Vector Column
 
 -- | A row is a vector of values, indexed by column position.
 type Row = Vector Value

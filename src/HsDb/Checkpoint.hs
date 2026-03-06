@@ -12,7 +12,6 @@ module HsDb.Checkpoint
   ) where
 
 import Control.Concurrent.STM (atomically, readTVar)
-import Control.Monad (when)
 import qualified Data.Binary as Binary
 import qualified Data.Binary.Get as Get
 import qualified Data.Binary.Put as Put
@@ -27,20 +26,11 @@ import qualified Data.Text as T
 import Data.Word (Word32, Word64)
 import System.Directory (renameFile, doesFileExist)
 import System.Posix.IO (openFd, closeFd, defaultFileFlags, OpenMode(..))
-import System.Posix.Types (Fd(..))
-import Foreign.C.Types (CInt(..))
 
+import HsDb.IO (fsyncFd)
 import HsDb.Types
 import HsDb.Table (Table(..), TableCatalog)
-import HsDb.WAL.Serialize ()  -- Binary instances
-
--- POSIX fsync via FFI (same as WAL.Writer)
-foreign import ccall "fsync" c_fsync :: CInt -> IO CInt
-
-fsyncFd :: Fd -> IO ()
-fsyncFd (Fd fd) = do
-  result <- c_fsync fd
-  when (result /= 0) $ fail "fsync failed during checkpoint"
+import HsDb.WAL.Serialize (putText, getText)  -- Binary instances + text helpers
 
 -- | Checkpoint file header.
 data CheckpointHeader = CheckpointHeader
@@ -132,8 +122,8 @@ encodeBody tables = LBS.toStrict $ Put.runPut $ do
   where
     encodeTable (name, schema, counter, rows) = do
       putText name
-      Put.putWord32be (fromIntegral (length schema))
-      mapM_ Binary.put schema
+      Put.putWord32be (fromIntegral (V.length schema))
+      V.mapM_ Binary.put schema
       Put.putWord64be (fromIntegral counter)
       Put.putWord64be (fromIntegral (length rows))
       mapM_ (\(rid, row) -> do
@@ -141,11 +131,6 @@ encodeBody tables = LBS.toStrict $ Put.runPut $ do
         Put.putWord32be (fromIntegral (V.length row))
         V.mapM_ Binary.put row
         ) rows
-
-    putText t = do
-      let bs = LBS.toStrict (Binary.encode t)
-      -- Binary Text encoding includes length prefix already
-      Put.putByteString bs
 
 -- Decoding helpers
 
@@ -181,9 +166,9 @@ decodeBody bs =
       sequence (replicate (fromIntegral numTables) getTable)
 
     getTable = do
-      name <- Binary.get :: Get.Get Text
+      name <- getText
       numCols <- Get.getWord32be
-      schema <- sequence (replicate (fromIntegral numCols) Binary.get)
+      schema <- V.fromList <$> sequence (replicate (fromIntegral numCols) Binary.get)
       counter <- fromIntegral <$> Get.getWord64be
       numRows <- Get.getWord64be
       rows <- sequence (replicate (fromIntegral numRows) getRow)

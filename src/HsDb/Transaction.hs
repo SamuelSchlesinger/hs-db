@@ -20,6 +20,7 @@ import Data.IORef
 import Data.Text (Text)
 import qualified Data.Map.Strict as Map
 import Data.Vector (Vector)
+import qualified Data.Vector as V
 import qualified Data.IntMap.Strict as IntMap
 
 import HsDb.Types
@@ -36,6 +37,7 @@ data PendingOp
   | PendingUpdate !TableName !RowId !(Vector Value)
   | PendingDelete !TableName !RowId
   | PendingDrop   !TableName
+  | PendingAlterAddColumn !TableName !Column
   deriving (Show, Eq)
 
 -- | Per-connection transaction state.
@@ -65,6 +67,7 @@ effectiveSchema catalog tx name = do
   where
     go _acc (PendingCreate n schema) | n == name = Right schema
     go _   (PendingDrop n)          | n == name = Left ("Table '" <> name <> "' does not exist")
+    go (Right schema) (PendingAlterAddColumn n col) | n == name = Right (V.snoc schema col)
     go acc _                                    = acc
 
 -- | Get effective rows for a table, overlaying pending ops on committed state.
@@ -79,8 +82,10 @@ effectiveRows catalog tx name = do
     Left err          -> return (Left err)
     Right Nothing     -> return (Right (IntMap.empty, 0))
     Right (Just table) -> do
-      rows <- atomically $ readTVar (tableRows table)
-      counter <- atomically $ readTVar (tableCounter table)
+      (rows, counter) <- atomically $ do
+        r <- readTVar (tableRows table)
+        c <- readTVar (tableCounter table)
+        return (r, c)
       return (Right (rows, counter))
   return $ case baseResult of
     Left err -> Left err
@@ -112,4 +117,6 @@ applyOps tname ops rows0 counter0 = fst (foldl go (rows0, counter0) ops)
       (IntMap.insert rid row rows, nxt)
     go (rows, nxt) (PendingDelete n rid) | n == tname =
       (IntMap.delete rid rows, nxt)
+    go (rows, nxt) (PendingAlterAddColumn n _) | n == tname =
+      (IntMap.map (`V.snoc` VNull) rows, nxt)
     go acc _ = acc

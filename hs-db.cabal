@@ -8,12 +8,13 @@ build-type:      Simple
 extra-doc-files: CHANGELOG.md
 
 common warnings
-    ghc-options: -Wall
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wpartial-fields
 
 library
     import:           warnings
     exposed-modules:
         HsDb
+        HsDb.IO
         HsDb.Types
         HsDb.Table
         HsDb.WAL.Types
@@ -44,7 +45,7 @@ library
         network,
         transformers
     hs-source-dirs:   src
-    default-language: Haskell2010
+    default-language: GHC2021
 
 executable hs-db-server
     import:           warnings
@@ -53,9 +54,10 @@ executable hs-db-server
         base ^>=4.18.3.0,
         hs-db,
         directory,
-        filepath
+        filepath,
+        unix
     hs-source-dirs:   app
-    default-language: Haskell2010
+    default-language: GHC2021
     ghc-options:      -threaded -rtsopts
 
 test-suite hs-db-test
@@ -91,4 +93,4 @@ test-suite hs-db-test
         network
     ghc-options:      -threaded -rtsopts
     hs-source-dirs:   test
-    default-language: Haskell2010
+    default-language: GHC2021

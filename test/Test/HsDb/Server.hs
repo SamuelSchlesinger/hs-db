@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 module Test.HsDb.Server (serverTests) where
 
@@ -17,6 +16,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
 
 import HsDb
+import HsDb.Logging (newLogger)
 import HsDb.Server
 
 serverTests :: Group
@@ -126,9 +126,10 @@ withTestServer config action =
           p <- socketPort s
           return (show p))
       let cfg' = config { serverPort = freePort }
+      logger <- newLogger
       tid <- forkIO $ do
         putMVar ready ()
-        runServer cfg' db
+        runServer cfg' logger db
       takeMVar ready
       threadDelay 100000  -- Give server time to start listening
       result <- action freePort

@@ -142,7 +142,7 @@ prop_validate_wrong_column_count = property $ do
 
 prop_validate_wrong_type :: Property
 prop_validate_wrong_type = property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   let badRow = V.fromList [VText "hello"]
   case validateRow schema badRow of
     Left (SchemaViolation _) -> success
@@ -150,7 +150,7 @@ prop_validate_wrong_type = property $ do
 
 prop_validate_null_not_allowed :: Property
 prop_validate_null_not_allowed = property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   let badRow = V.fromList [VNull]
   case validateRow schema badRow of
     Left (SchemaViolation _) -> success

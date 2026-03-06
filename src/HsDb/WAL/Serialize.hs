@@ -8,6 +8,8 @@ module HsDb.WAL.Serialize
   , decodeFramed
   , writeWALHeader
   , readWALHeader
+  , putText
+  , getText
   ) where
 
 import Data.Binary (Binary(..), Get, Put)
@@ -89,7 +91,7 @@ instance Binary WALCommand where
   put (CmdCreateTable name schema) = do
     Put.putWord8 0
     putText name
-    putListOf schema
+    putListOf (V.toList schema)
   put (CmdInsertRow name rid row) = do
     Put.putWord8 1
     putText name
@@ -107,15 +109,20 @@ instance Binary WALCommand where
   put (CmdDropTable name) = do
     Put.putWord8 4
     putText name
+  put (CmdAlterAddColumn name col) = do
+    Put.putWord8 5
+    putText name
+    Binary.put col
 
   get = do
     tag <- Get.getWord8
     case tag of
-      0 -> CmdCreateTable <$> getText <*> getListOf
+      0 -> CmdCreateTable <$> getText <*> (V.fromList <$> getListOf)
       1 -> CmdInsertRow <$> getText <*> (fromIntegral <$> Get.getWord64be) <*> getVector
       2 -> CmdUpdateRow <$> getText <*> (fromIntegral <$> Get.getWord64be) <*> getVector
       3 -> CmdDeleteRow <$> getText <*> (fromIntegral <$> Get.getWord64be)
       4 -> CmdDropTable <$> getText
+      5 -> CmdAlterAddColumn <$> getText <*> Binary.get
       _ -> fail ("Unknown WALCommand tag: " ++ show tag)
 
 instance Binary WALEntry where

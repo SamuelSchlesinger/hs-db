@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | TCP server that accepts PostgreSQL-protocol connections and executes
 -- SQL queries against an hs-db 'Database'.
@@ -47,9 +46,8 @@ defaultServerConfig = ServerConfig
   }
 
 -- | Run the server, accepting connections until the action is interrupted.
-runServer :: ServerConfig -> Database -> IO ()
-runServer config db = do
-  logger <- newLogger
+runServer :: ServerConfig -> Logger -> Database -> IO ()
+runServer config logger db = do
   connCount <- newTVarIO (0 :: Int)
   let hints = defaultHints
         { addrFlags = [AI_PASSIVE]
@@ -147,6 +145,14 @@ queryLoop config h rs db logger mtx = do
     Just (QueryMsg sql) -> do
       mtx' <- handleQuery h db sql logger mtx
       queryLoop config h rs db logger mtx'
+    Just (InvalidMsg err) -> do
+      sendErrorResponse h err
+      sendReady h mtx
+      queryLoop config h rs db logger mtx
+    Just (UnknownMsg _) -> do
+      sendErrorResponse h "Unsupported message type"
+      sendReady h mtx
+      queryLoop config h rs db logger mtx
     Just _ -> do
       sendErrorResponse h "Unsupported message type"
       sendReady h mtx
@@ -154,7 +160,13 @@ queryLoop config h rs db logger mtx = do
 
 handleQuery :: Handle -> Database -> Text -> Logger -> Maybe TxState
             -> IO (Maybe TxState)
-handleQuery h db sql logger mtx
+handleQuery h db sql logger mtx = do
+  logInfo logger ("Query: " <> T.take 200 sql)
+  handleQuery' h db sql logger mtx
+
+handleQuery' :: Handle -> Database -> Text -> Logger -> Maybe TxState
+             -> IO (Maybe TxState)
+handleQuery' h db sql logger mtx
   | T.null (T.strip sql) = do
       sendEmptyQueryResponse h
       sendReady h mtx

@@ -39,7 +39,7 @@ expectRight (Left e)  = error ("Expected Right, got Left: " ++ show e)
 
 prop_create_insert_select :: Property
 prop_create_insert_select = withTests 10 $ property $ do
-  let schema = [Column "id" TInt64 False, Column "name" TText True]
+  let schema = V.fromList [Column "id" TInt64 False, Column "name" TText True]
   let row = V.fromList [VInt64 42, VText "hello"]
   (rowId, rows) <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
@@ -53,7 +53,7 @@ prop_create_insert_select = withTests 10 $ property $ do
 
 prop_durability_roundtrip :: Property
 prop_durability_roundtrip = withTests 5 $ property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   let row1 = V.fromList [VInt32 1]
   let row2 = V.fromList [VInt32 2]
   rows <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
@@ -71,7 +71,7 @@ prop_durability_roundtrip = withTests 5 $ property $ do
 
 prop_concurrent_inserts :: Property
 prop_concurrent_inserts = withTests 5 $ property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   let n = 20
   ids <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
@@ -99,8 +99,8 @@ prop_concurrent_inserts = withTests 5 $ property $ do
 
 prop_drop_recreate :: Property
 prop_drop_recreate = withTests 5 $ property $ do
-  let schema1 = [Column "a" TInt32 False]
-  let schema2 = [Column "b" TText False]
+  let schema1 = V.fromList [Column "a" TInt32 False]
+  let schema2 = V.fromList [Column "b" TText False]
   rows <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     withDatabase config $ \db -> do
@@ -114,7 +114,7 @@ prop_drop_recreate = withTests 5 $ property $ do
 
 prop_update_delete_lifecycle :: Property
 prop_update_delete_lifecycle = withTests 5 $ property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   rows <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     withDatabase config $ \db -> do
@@ -131,7 +131,7 @@ prop_withDatabase_cleanup = withTests 5 $ property $ do
   result <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     _ <- withDatabase config $ \db -> do
-      expectRight =<< runExceptT (durableCreateTable db "t" [Column "x" TInt32 False])
+      expectRight =<< runExceptT (durableCreateTable db "t" (V.fromList [Column "x" TInt32 False]))
       _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 1]))
       return ()
     -- Reopen: data should persist
@@ -141,7 +141,7 @@ prop_withDatabase_cleanup = withTests 5 $ property $ do
 
 prop_async_variants :: Property
 prop_async_variants = withTests 5 $ property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   rows <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     withDatabase config $ \db -> do
@@ -154,7 +154,7 @@ prop_async_variants = withTests 5 $ property $ do
 
 prop_flusher_crash_readonly :: Property
 prop_flusher_crash_readonly = withTests 5 $ property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   writeResult <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     db <- openDatabase config
@@ -189,7 +189,7 @@ prop_deterministic_shutdown = withTests 5 $ property $ do
   evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     db <- openDatabase config
-    expectRight =<< runExceptT (durableCreateTable db "t" [Column "x" TInt32 False])
+    expectRight =<< runExceptT (durableCreateTable db "t" (V.fromList [Column "x" TInt32 False]))
     _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 1]))
     _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 2]))
     -- closeDatabase should block on walDone and complete deterministically
@@ -201,7 +201,7 @@ prop_deterministic_shutdown = withTests 5 $ property $ do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     -- Write + close
     db <- openDatabase config
-    expectRight =<< runExceptT (durableCreateTable db "t" [Column "x" TInt32 False])
+    expectRight =<< runExceptT (durableCreateTable db "t" (V.fromList [Column "x" TInt32 False]))
     _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 1]))
     closeDatabase db
     -- Reopen and read
@@ -216,7 +216,7 @@ prop_concurrent_close_no_deadlock = withTests 5 $ property $ do
   result <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     db <- openDatabase config
-    expectRight =<< runExceptT (durableCreateTable db "t" [Column "x" TInt32 False])
+    expectRight =<< runExceptT (durableCreateTable db "t" (V.fromList [Column "x" TInt32 False]))
     _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 1]))
     -- Launch two concurrent close calls with a timeout to detect deadlocks
     done1 <- newEmptyMVar

@@ -50,6 +50,10 @@ data FrontendMsg
     -- ^ Client wants to disconnect
   | SSLRequest
     -- ^ Client is requesting SSL
+  | InvalidMsg !Text
+    -- ^ Message with invalid encoding (e.g. bad UTF-8)
+  | UnknownMsg !Word8
+    -- ^ Unknown frontend message type
   deriving (Show)
 
 -- Reading bytes from a handle with buffering
@@ -123,6 +127,10 @@ parseParams bs
           rest4 = if BS.null rest3 then rest3 else BS.drop 1 rest3
       in (key, val) : parseParams rest4
 
+-- | Maximum allowed message size (64 MiB).
+maxMessageSize :: Int
+maxMessageSize = 67108864
+
 -- | Read a frontend message (has 1-byte type prefix + 4-byte length).
 readFrontendMsg :: Handle -> ReadState -> IO FrontendMsg
 readFrontendMsg h rs = do
@@ -130,16 +138,21 @@ readFrontendMsg h rs = do
   let msgType = BS.head typeBytes
   lenBytes <- readExact h rs 4
   let len = getInt32 lenBytes
-  payload <- if len > 4 then readExact h rs (len - 4) else return BS.empty
-  return (parseFrontend msgType payload)
+  if len > maxMessageSize
+    then return (InvalidMsg "Message too large")
+    else do
+      payload <- if len > 4 then readExact h rs (len - 4) else return BS.empty
+      return (parseFrontend msgType payload)
 
 parseFrontend :: Word8 -> ByteString -> FrontendMsg
 parseFrontend 0x51 payload = -- 'Q'
   -- Query: null-terminated string
   let query = BS.takeWhile (/= 0) payload
-  in QueryMsg (TE.decodeUtf8 query)
+  in case TE.decodeUtf8' query of
+       Right t  -> QueryMsg t
+       Left _   -> InvalidMsg "Invalid UTF-8 in query"
 parseFrontend 0x58 _ = TerminateMsg -- 'X'
-parseFrontend _ _    = TerminateMsg -- Unknown, treat as terminate
+parseFrontend tag _  = UnknownMsg tag
 
 -- Sending backend messages
 

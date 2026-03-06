@@ -19,7 +19,9 @@ import Data.Word (Word64)
 import System.Directory (doesFileExist)
 
 import HsDb.Types
-import HsDb.Table
+import HsDb.Table (Table(..), TableCatalog, newTableCatalog, createTable,
+                    lookupTable, insertRowWithId, updateRow, deleteRow, dropTable,
+                    alterAddColumn)
 import HsDb.WAL.Types
 import HsDb.WAL.Serialize
 import HsDb.Checkpoint
@@ -94,6 +96,8 @@ applyCommand catalog cmd = case cmd of
     deleteRow table name rowId
 
   CmdDropTable name -> dropTable catalog name
+
+  CmdAlterAddColumn name col -> alterAddColumn catalog name col
 
 -- | Recovery with checkpoint support: load checkpoint if available,
 -- then replay only WAL entries after the checkpoint sequence number.

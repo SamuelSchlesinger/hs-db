@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Main public API for hs-db. Provides bracket-style database lifecycle
 -- management, synchronous durable operations that block until fsync, and
@@ -49,7 +48,7 @@ import Data.IORef (readIORef, writeIORef)
 import Data.Text (unpack, pack)
 import Data.Vector (Vector)
 import System.Directory (doesFileExist)
-import System.IO (IOMode(..), openBinaryFile, hClose)
+import System.IO (IOMode(..), openBinaryFile, hClose, hPutStrLn, stderr)
 
 import HsDb.Types
 import HsDb.Integration (Database(..), createTableSTM, insertRowSTM,
@@ -84,7 +83,8 @@ openDatabase config = do
     Just cpPath -> replayWALWithCheckpoint cpPath path
   case replayResult of
     Left err -> throwIO (userError (show err))
-    Right (catalog, lastSeq, _warnings) -> do
+    Right (catalog, lastSeq, warnings) -> do
+      mapM_ (\w -> hPutStrLn stderr (unpack w)) warnings
       status <- newTVarIO DbWritable
       (walHandle, _) <- openWAL config status
       writeIORef (walSeqCounter walHandle) lastSeq

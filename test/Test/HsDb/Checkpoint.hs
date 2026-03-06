@@ -31,7 +31,7 @@ mkConfig dir = (defaultDatabaseConfig (dir </> "test.wal"))
 
 prop_checkpoint_roundtrip :: Property
 prop_checkpoint_roundtrip = withTests 5 $ property $ do
-  let schema = [Column "x" TInt32 False, Column "y" TText True]
+  let schema = V.fromList [Column "x" TInt32 False, Column "y" TText True]
   let row1 = V.fromList [VInt32 1, VText "hello"]
   let row2 = V.fromList [VInt32 2, VNull]
   rows <- evalIO $ withSystemTempDirectory "hs-db-cp-test" $ \dir -> do
@@ -49,7 +49,7 @@ prop_checkpoint_roundtrip = withTests 5 $ property $ do
 
 prop_checkpoint_recovery :: Property
 prop_checkpoint_recovery = withTests 5 $ property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   rows <- evalIO $ withSystemTempDirectory "hs-db-cp-test" $ \dir -> do
     let config = mkConfig dir
     -- Write, checkpoint
@@ -64,7 +64,7 @@ prop_checkpoint_recovery = withTests 5 $ property $ do
 
 prop_checkpoint_with_new_entries :: Property
 prop_checkpoint_with_new_entries = withTests 5 $ property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   rows <- evalIO $ withSystemTempDirectory "hs-db-cp-test" $ \dir -> do
     let config = mkConfig dir
     withDatabase config $ \db -> do
@@ -85,8 +85,8 @@ prop_checkpoint_with_new_entries = withTests 5 $ property $ do
 
 prop_checkpoint_multiple_tables :: Property
 prop_checkpoint_multiple_tables = withTests 5 $ property $ do
-  let schema1 = [Column "a" TInt32 False]
-  let schema2 = [Column "b" TText False]
+  let schema1 = V.fromList [Column "a" TInt32 False]
+  let schema2 = V.fromList [Column "b" TText False]
   (rows1, rows2) <- evalIO $ withSystemTempDirectory "hs-db-cp-test" $ \dir -> do
     let config = mkConfig dir
     withDatabase config $ \db -> do
@@ -104,7 +104,7 @@ prop_checkpoint_multiple_tables = withTests 5 $ property $ do
 
 prop_checkpoint_after_drop :: Property
 prop_checkpoint_after_drop = withTests 5 $ property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   result <- evalIO $ withSystemTempDirectory "hs-db-cp-test" $ \dir -> do
     let config = mkConfig dir
     withDatabase config $ \db -> do
@@ -121,7 +121,7 @@ prop_checkpoint_after_drop = withTests 5 $ property $ do
 prop_no_checkpoint_fallback :: Property
 prop_no_checkpoint_fallback = withTests 5 $ property $ do
   -- Without a checkpoint file, should fall back to full WAL replay
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   rows <- evalIO $ withSystemTempDirectory "hs-db-cp-test" $ \dir -> do
     let config = mkConfig dir
     withDatabase config $ \db -> do

@@ -69,7 +69,7 @@ prop_header_only_empty_db = property $ do
 
 prop_replay_create_insert :: Property
 prop_replay_create_insert = property $ do
-  let schema = [Column "id" TInt64 False, Column "name" TText True]
+  let schema = V.fromList [Column "id" TInt64 False, Column "name" TText True]
   let row = V.fromList [VInt64 42, VText "hello"]
   result <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let path = dir </> "test.wal"
@@ -91,8 +91,8 @@ prop_replay_create_insert = property $ do
 
 prop_replay_drop_recreate :: Property
 prop_replay_drop_recreate = property $ do
-  let schema1 = [Column "a" TInt32 False]
-  let schema2 = [Column "b" TText False]
+  let schema1 = V.fromList [Column "a" TInt32 False]
+  let schema2 = V.fromList [Column "b" TText False]
   let row = V.fromList [VText "world"]
   result <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let path = dir </> "test.wal"
@@ -119,7 +119,7 @@ prop_replay_drop_recreate = property $ do
 
 prop_replay_update_delete :: Property
 prop_replay_update_delete = property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   let row1 = V.fromList [VInt32 1]
   let row2 = V.fromList [VInt32 2]
   let row3 = V.fromList [VInt32 3]
@@ -146,7 +146,7 @@ prop_replay_update_delete = property $ do
 
 prop_replay_corrupted_trailing :: Property
 prop_replay_corrupted_trailing = property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   let row = V.fromList [VInt32 1]
   result <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let path = dir </> "test.wal"
@@ -171,7 +171,7 @@ prop_replay_corrupted_trailing = property $ do
 
 prop_replay_preserves_row_ids :: Property
 prop_replay_preserves_row_ids = property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   result <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let path = dir </> "test.wal"
     writeTestWAL path
@@ -195,7 +195,7 @@ prop_replay_preserves_row_ids = property $ do
 
 prop_replay_duplicate_rowid :: Property
 prop_replay_duplicate_rowid = property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   let row1 = V.fromList [VInt32 1]
   let row2 = V.fromList [VInt32 2]
   result <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
@@ -215,7 +215,7 @@ prop_replay_duplicate_rowid = property $ do
 
 prop_replay_rejects_seq_zero :: Property
 prop_replay_rejects_seq_zero = property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   result <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let path = dir </> "test.wal"
     writeTestWAL path
@@ -229,7 +229,7 @@ prop_replay_rejects_seq_zero = property $ do
 
 prop_replay_rejects_non_monotonic :: Property
 prop_replay_rejects_non_monotonic = property $ do
-  let schema = [Column "x" TInt32 False]
+  let schema = V.fromList [Column "x" TInt32 False]
   let row = V.fromList [VInt32 1]
   result <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let path = dir </> "test.wal"

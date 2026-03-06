@@ -8,6 +8,7 @@ module HsDb.SQL.Parser
   ) where
 
 import Data.Char (isAlphaNum, isAlpha, isDigit, isSpace)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Read as TR
@@ -131,15 +132,20 @@ pIdentifier s0 = do
         Just ('"', rest') -> Right (ident, st { psInput = rest', psPos = psPos st + T.length ident + 1 })
         _ -> Left (ParseError (psPos st) "Unterminated quoted identifier")
 
-    isReserved w = w `elem`
-      [ "select", "from", "where", "insert", "into", "values"
-      , "update", "set", "delete", "create", "drop", "table"
-      , "and", "or", "not", "null", "is", "true", "false"
-      , "int", "integer", "bigint", "float", "double", "text"
-      , "varchar", "boolean", "bool", "bytea", "precision"
-      , "order", "by", "limit", "offset", "asc", "desc"
-      , "begin", "commit", "rollback"
-      ]
+    isReserved w = Set.member w reservedWords
+
+reservedWords :: Set.Set Text
+reservedWords = Set.fromList
+  [ "select", "from", "where", "insert", "into", "values"
+  , "update", "set", "delete", "create", "drop", "table"
+  , "and", "or", "not", "null", "is", "true", "false"
+  , "int", "integer", "bigint", "float", "double", "text"
+  , "varchar", "boolean", "bool", "bytea", "precision"
+  , "order", "by", "limit", "offset", "asc", "desc"
+  , "begin", "commit", "rollback"
+  , "distinct", "as", "count", "sum", "avg", "min", "max"
+  , "like", "ilike", "in", "alter", "add", "column", "explain"
+  ]
 
 -- Statements
 
@@ -147,12 +153,14 @@ pStatement :: Parser Statement
 pStatement s0 = do
   let s = skipWhitespace s0
       remaining = T.toLower (T.take 10 (psInput s))
-  if T.isPrefixOf "create" remaining then pCreateTable s
+  if T.isPrefixOf "explain" remaining then pExplain s
+  else if T.isPrefixOf "create" remaining then pCreateTable s
   else if T.isPrefixOf "drop" remaining then pDropTable s
   else if T.isPrefixOf "insert" remaining then pInsert s
   else if T.isPrefixOf "select" remaining then pSelect s
   else if T.isPrefixOf "update" remaining then pUpdate s
   else if T.isPrefixOf "delete" remaining then pDelete s
+  else if T.isPrefixOf "alter" remaining then pAlterTable s
   else if T.isPrefixOf "begin" remaining then pBegin s
   else if T.isPrefixOf "commit" remaining then pCommit s
   else if T.isPrefixOf "rollback" remaining then pRollback s
@@ -172,6 +180,13 @@ pRollback :: Parser Statement
 pRollback s0 = do
   ((), s1) <- pKeyword "ROLLBACK" s0
   Right (Rollback, s1)
+
+-- EXPLAIN <statement>
+pExplain :: Parser Statement
+pExplain s0 = do
+  ((), s1) <- pKeyword "EXPLAIN" s0
+  (stmt, s2) <- pStatement s1
+  Right (Explain stmt, s2)
 
 -- CREATE TABLE name (col1 type1 [NOT NULL], ...)
 pCreateTable :: Parser Statement
@@ -231,6 +246,17 @@ pDropTable s0 = do
   ((), s2) <- pKeyword "TABLE" s1
   (name, s3) <- pIdentifier s2
   Right (DropTable name, s3)
+
+-- ALTER TABLE name ADD COLUMN colname type [NOT NULL]
+pAlterTable :: Parser Statement
+pAlterTable s0 = do
+  ((), s1) <- pKeyword "ALTER" s0
+  ((), s2) <- pKeyword "TABLE" s1
+  (name, s3) <- pIdentifier s2
+  ((), s4) <- pKeyword "ADD" s3
+  ((), s5) <- pKeyword "COLUMN" s4
+  (colDef, s6) <- pColumnDef s5
+  Right (AlterTableAddColumn name colDef, s6)
 
 -- INSERT INTO name (cols) VALUES (vals), ...
 pInsert :: Parser Statement
@@ -316,19 +342,20 @@ pNumLit s0 = do
               in Right (LitInt val, s2)
             _ -> pFail ("Invalid number: " <> digits) s0
 
--- SELECT cols FROM table [WHERE expr] [ORDER BY ...] [LIMIT n] [OFFSET n]
+-- SELECT [DISTINCT] cols FROM table [WHERE expr] [ORDER BY ...] [LIMIT n] [OFFSET n]
 pSelect :: Parser Statement
 pSelect s0 = do
   ((), s1) <- pKeyword "SELECT" s0
-  (targets, s2) <- pSelectTargets s1
-  ((), s3) <- pKeyword "FROM" s2
-  (name, s4) <- pIdentifier s3
-  (wh, s5) <- pOptional pWhere s4
-  (mOrderBy, s6) <- pOptional pOrderBy s5
-  (mLimit, s7) <- pOptional pLimit s6
-  (mOffset, s8) <- pOptional pOffset s7
+  (isDistinct, s2) <- pTryKeyword "DISTINCT" s1
+  (targets, s3) <- pSelectTargets s2
+  ((), s4) <- pKeyword "FROM" s3
+  (name, s5) <- pIdentifier s4
+  (wh, s6) <- pOptional pWhere s5
+  (mOrderBy, s7) <- pOptional pOrderBy s6
+  (mLimit, s8) <- pOptional pLimit s7
+  (mOffset, s9) <- pOptional pOffset s8
   let orderClauses = maybe [] id mOrderBy
-  Right (Select targets name wh orderClauses mLimit mOffset, s8)
+  Right (Select isDistinct targets name wh orderClauses mLimit mOffset, s9)
 
 pOrderBy :: Parser [OrderByClause]
 pOrderBy s0 = do
@@ -370,9 +397,59 @@ pSelectTargets s0 = do
     _ -> pCommaSep pSelectColumn s
 
 pSelectColumn :: Parser SelectTarget
-pSelectColumn s = do
-  (name, s') <- pIdentifier s
-  Right (Column name, s')
+pSelectColumn s0 = do
+  let s = skipWhitespace s0
+  -- Try aggregate functions first
+  case pTryAgg s of
+    Right (Just agg, s1) -> do
+      (mAlias, s2) <- pOptional pAlias s1
+      Right (Agg agg mAlias, s2)
+    _ -> do
+      (name, s1) <- pIdentifier s0
+      (mAlias, s2) <- pOptional pAlias s1
+      case mAlias of
+        Nothing    -> Right (Column name, s2)
+        Just alias -> Right (ColumnAs name alias, s2)
+
+pAlias :: Parser Text
+pAlias s0 = do
+  ((), s1) <- pKeyword "AS" s0
+  pIdentifier s1
+
+-- Try to parse an aggregate function. Returns (Just agg, advanced state) on
+-- match, or (Nothing, original state) on no match.
+pTryAgg :: PState -> Either ParseError (Maybe AggFunc, PState)
+pTryAgg s0 = do
+  let s = skipWhitespace s0
+  case pTryKeyword "COUNT" s of
+    Right (True, s1) -> do
+      ((), s2) <- pSymbol '(' s1
+      let s2' = skipWhitespace s2
+      case T.uncons (psInput s2') of
+        Just ('*', rest) -> do
+          let s3 = s2' { psInput = rest, psPos = psPos s2' + 1 }
+          ((), s4) <- pSymbol ')' s3
+          Right (Just AggCount, s4)
+        _ -> do
+          (col, s3) <- pIdentifier s2
+          ((), s4) <- pSymbol ')' s3
+          Right (Just (AggCountCol col), s4)
+    _ -> case pTryKeyword "SUM" s of
+      Right (True, s1) -> parseAggWithCol AggSum s1
+      _ -> case pTryKeyword "AVG" s of
+        Right (True, s1) -> parseAggWithCol AggAvg s1
+        _ -> case pTryKeyword "MIN" s of
+          Right (True, s1) -> parseAggWithCol AggMin s1
+          _ -> case pTryKeyword "MAX" s of
+            Right (True, s1) -> parseAggWithCol AggMax s1
+            _ -> Right (Nothing, s0)
+
+parseAggWithCol :: (Text -> AggFunc) -> PState -> Either ParseError (Maybe AggFunc, PState)
+parseAggWithCol mkAgg s1 = do
+  ((), s2) <- pSymbol '(' s1
+  (col, s3) <- pIdentifier s2
+  ((), s4) <- pSymbol ')' s3
+  Right (Just (mkAgg col), s4)
 
 -- UPDATE table SET col = expr, ... [WHERE expr]
 pUpdate :: Parser Statement
@@ -406,7 +483,7 @@ pWhere s0 = do
   ((), s1) <- pKeyword "WHERE" s0
   pExpr s1
 
--- Expression parser with precedence: OR < AND < comparison < atom
+-- Expression parser with precedence: OR < AND < NOT < comparison < atom
 pExpr :: Parser Expr
 pExpr = pOr
 
@@ -425,16 +502,25 @@ pOr s0 = do
 
 pAnd :: Parser Expr
 pAnd s0 = do
-  (left, s1) <- pComparison s0
+  (left, s1) <- pNot s0
   pAndRest left s1
   where
     pAndRest left s = do
       (isAnd, s1) <- pTryKeyword "AND" s
       if isAnd
         then do
-          (right, s2) <- pComparison s1
+          (right, s2) <- pNot s1
           pAndRest (ExprBinOp OpAnd left right) s2
         else Right (left, s)
+
+pNot :: Parser Expr
+pNot s0 = do
+  (isNot, s1) <- pTryKeyword "NOT" s0
+  if isNot
+    then do
+      (e, s2) <- pNot s1
+      Right (ExprNot e, s2)
+    else pComparison s0
 
 pComparison :: Parser Expr
 pComparison s0 = do
@@ -449,12 +535,30 @@ pComparison s0 = do
         then Right (ExprIsNotNull left, s4)
         else Right (ExprIsNull left, s4)
     _ -> do
-      -- Try comparison operators
-      case pCompOp s1' of
-        Right (op, s2) -> do
+      -- Try LIKE / ILIKE
+      case pTryKeyword "LIKE" s1' of
+        Right (True, s2) -> do
           (right, s3) <- pAtom s2
-          Right (ExprBinOp op left right, s3)
-        Left _ -> Right (left, s1')
+          Right (ExprBinOp OpLike left right, s3)
+        _ -> case pTryKeyword "ILIKE" s1' of
+          Right (True, s2) -> do
+            (right, s3) <- pAtom s2
+            Right (ExprBinOp OpILike left right, s3)
+          _ ->
+            -- Try IN (val1, val2, ...)
+            case pTryKeyword "IN" s1' of
+              Right (True, s2) -> do
+                ((), s3) <- pSymbol '(' s2
+                (exprs, s4) <- pCommaSep pExpr s3
+                ((), s5) <- pSymbol ')' s4
+                Right (ExprIn left exprs, s5)
+              _ -> do
+                -- Try comparison operators
+                case pCompOp s1' of
+                  Right (op, s2) -> do
+                    (right, s3) <- pAtom s2
+                    Right (ExprBinOp op left right, s3)
+                  Left _ -> Right (left, s1')
 
 pCompOp :: Parser BinOp
 pCompOp s0 = do

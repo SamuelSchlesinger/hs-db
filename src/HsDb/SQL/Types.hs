@@ -9,6 +9,7 @@ module HsDb.SQL.Types
   , SelectTarget(..)
   , SortOrder(..)
   , OrderByClause(..)
+  , AggFunc(..)
   ) where
 
 import Data.Text (Text)
@@ -21,12 +22,16 @@ data Statement
     -- ^ @DROP TABLE name@
   | Insert !Text [Text] [[Literal]]
     -- ^ table, column names, rows of values
-  | Select [SelectTarget] !Text (Maybe Expr) [OrderByClause] (Maybe Int) (Maybe Int)
-    -- ^ columns (or star), table, WHERE, ORDER BY, LIMIT, OFFSET
+  | Select !Bool [SelectTarget] !Text (Maybe Expr) [OrderByClause] (Maybe Int) (Maybe Int)
+    -- ^ DISTINCT flag, columns (or star), table, WHERE, ORDER BY, LIMIT, OFFSET
   | Update !Text [(Text, Expr)] (Maybe Expr)
     -- ^ table, SET assignments, optional WHERE
   | Delete !Text (Maybe Expr)
     -- ^ table, optional WHERE
+  | AlterTableAddColumn !Text ColumnDef
+    -- ^ @ALTER TABLE name ADD COLUMN coldef@
+  | Explain Statement
+    -- ^ @EXPLAIN statement@
   | Begin
   | Commit
   | Rollback
@@ -36,6 +41,20 @@ data Statement
 data SelectTarget
   = Star
   | Column !Text
+  | ColumnAs !Text !Text
+    -- ^ column name, alias
+  | Agg !AggFunc !(Maybe Text)
+    -- ^ aggregate function, optional alias
+  deriving (Show, Eq)
+
+-- | Aggregate functions.
+data AggFunc
+  = AggCount       -- ^ COUNT(*)
+  | AggCountCol !Text  -- ^ COUNT(col)
+  | AggSum !Text   -- ^ SUM(col)
+  | AggAvg !Text   -- ^ AVG(col)
+  | AggMin !Text   -- ^ MIN(col)
+  | AggMax !Text   -- ^ MAX(col)
   deriving (Show, Eq)
 
 -- | Sort order for ORDER BY clauses.
@@ -82,6 +101,8 @@ data BinOp
   | OpGte
   | OpAnd
   | OpOr
+  | OpLike
+  | OpILike
   deriving (Show, Eq)
 
 -- | SQL expressions (WHERE clauses, value expressions).
@@ -91,4 +112,6 @@ data Expr
   | ExprBinOp !BinOp Expr Expr
   | ExprIsNull Expr
   | ExprIsNotNull Expr
+  | ExprIn Expr [Expr]
+  | ExprNot Expr
   deriving (Show, Eq)
