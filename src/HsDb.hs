@@ -41,6 +41,8 @@ import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newMVar, readMVar, takeMVar, putMVar, tryTakeMVar)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, bracket, finally, throwIO, try)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Except (ExceptT)
 import Data.IORef (writeIORef)
 import Data.Text (unpack, pack)
 import Data.Vector (Vector)
@@ -49,7 +51,8 @@ import System.IO (IOMode(..), openBinaryFile, hClose)
 
 import HsDb.Types
 import HsDb.Integration (Database(..), createTableSTM, insertRowSTM,
-                          updateRowSTM, deleteRowSTM, dropTableSTM, selectAllSTM)
+                          updateRowSTM, deleteRowSTM, dropTableSTM, selectAllSTM,
+                          atomicallyE)
 import HsDb.WAL.Types
 import HsDb.WAL.Writer (WALHandle(..), openWAL, closeWAL, flusherThread)
 import HsDb.WAL.Replay (replayWAL)
@@ -112,111 +115,77 @@ closeDatabase db = do
        ) `finally` closeWAL walHandle
 
 -- | Select all rows from a table (pure STM read, no durability needed).
-selectAll :: Database -> TableName -> IO (Either DbError [(RowId, Row)])
-selectAll db name = atomically $ selectAllSTM db name
+selectAll :: Database -> TableName -> ExceptT DbError IO [(RowId, Row)]
+selectAll db name = atomicallyE $ selectAllSTM db name
 
 -- Synchronous durable operations --
 
 -- | Create a table, blocking until the WAL entry is fsynced to disk.
-durableCreateTable :: Database -> TableName -> Schema -> IO (Either DbError ())
+durableCreateTable :: Database -> TableName -> Schema -> ExceptT DbError IO ()
 durableCreateTable db name schema = do
-  result <- atomically $ createTableSTM db name schema
-  case result of
-    Left err -> return (Left err)
-    Right (_, callback) -> do
-      atomically $ takeTMVar callback
-      return (Right ())
+  (_, callback) <- atomicallyE $ createTableSTM db name schema
+  lift $ atomically $ takeTMVar callback
 
 -- | Insert a row, blocking until the WAL entry is fsynced. Returns the
 -- assigned 'RowId' on success.
-durableInsert :: Database -> TableName -> Vector Value -> IO (Either DbError RowId)
+durableInsert :: Database -> TableName -> Vector Value -> ExceptT DbError IO RowId
 durableInsert db name row = do
-  result <- atomically $ insertRowSTM db name row
-  case result of
-    Left err -> return (Left err)
-    Right (rowId, callback) -> do
-      atomically $ takeTMVar callback
-      return (Right rowId)
+  (rowId, callback) <- atomicallyE $ insertRowSTM db name row
+  lift $ atomically $ takeTMVar callback
+  return rowId
 
 -- | Update an existing row in place, blocking until the WAL entry is fsynced.
-durableUpdate :: Database -> TableName -> RowId -> Vector Value -> IO (Either DbError ())
+durableUpdate :: Database -> TableName -> RowId -> Vector Value -> ExceptT DbError IO ()
 durableUpdate db name rowId row = do
-  result <- atomically $ updateRowSTM db name rowId row
-  case result of
-    Left err -> return (Left err)
-    Right callback -> do
-      atomically $ takeTMVar callback
-      return (Right ())
+  callback <- atomicallyE $ updateRowSTM db name rowId row
+  lift $ atomically $ takeTMVar callback
 
 -- | Delete a row by ID, blocking until the WAL entry is fsynced.
-durableDelete :: Database -> TableName -> RowId -> IO (Either DbError ())
+durableDelete :: Database -> TableName -> RowId -> ExceptT DbError IO ()
 durableDelete db name rowId = do
-  result <- atomically $ deleteRowSTM db name rowId
-  case result of
-    Left err -> return (Left err)
-    Right callback -> do
-      atomically $ takeTMVar callback
-      return (Right ())
+  callback <- atomicallyE $ deleteRowSTM db name rowId
+  lift $ atomically $ takeTMVar callback
 
 -- | Drop a table, blocking until the WAL entry is fsynced.
-durableDrop :: Database -> TableName -> IO (Either DbError ())
+durableDrop :: Database -> TableName -> ExceptT DbError IO ()
 durableDrop db name = do
-  result <- atomically $ dropTableSTM db name
-  case result of
-    Left err -> return (Left err)
-    Right callback -> do
-      atomically $ takeTMVar callback
-      return (Right ())
+  callback <- atomicallyE $ dropTableSTM db name
+  lift $ atomically $ takeTMVar callback
 
 -- Async variants --
 
 -- | Create a table, returning an @IO ()@ action that blocks until durable.
 -- The table is immediately visible to STM readers.
 asyncCreateTable :: Database -> TableName -> Schema
-                 -> IO (Either DbError ((), IO ()))
+                 -> ExceptT DbError IO ((), IO ())
 asyncCreateTable db name schema = do
-  result <- atomically $ createTableSTM db name schema
-  case result of
-    Left err -> return (Left err)
-    Right (_, callback) ->
-      return (Right ((), atomically (takeTMVar callback)))
+  (_, callback) <- atomicallyE $ createTableSTM db name schema
+  return ((), atomically (takeTMVar callback))
 
 -- | Insert a row, returning the 'RowId' and a durability waiter.
 asyncInsert :: Database -> TableName -> Vector Value
-            -> IO (Either DbError (RowId, IO ()))
+            -> ExceptT DbError IO (RowId, IO ())
 asyncInsert db name row = do
-  result <- atomically $ insertRowSTM db name row
-  case result of
-    Left err -> return (Left err)
-    Right (rowId, callback) ->
-      return (Right (rowId, atomically (takeTMVar callback)))
+  (rowId, callback) <- atomicallyE $ insertRowSTM db name row
+  return (rowId, atomically (takeTMVar callback))
 
 -- | Update a row, returning a durability waiter.
 asyncUpdate :: Database -> TableName -> RowId -> Vector Value
-            -> IO (Either DbError ((), IO ()))
+            -> ExceptT DbError IO ((), IO ())
 asyncUpdate db name rowId row = do
-  result <- atomically $ updateRowSTM db name rowId row
-  case result of
-    Left err -> return (Left err)
-    Right callback ->
-      return (Right ((), atomically (takeTMVar callback)))
+  callback <- atomicallyE $ updateRowSTM db name rowId row
+  return ((), atomically (takeTMVar callback))
 
 -- | Delete a row, returning a durability waiter.
 asyncDelete :: Database -> TableName -> RowId
-            -> IO (Either DbError ((), IO ()))
+            -> ExceptT DbError IO ((), IO ())
 asyncDelete db name rowId = do
-  result <- atomically $ deleteRowSTM db name rowId
-  case result of
-    Left err -> return (Left err)
-    Right callback ->
-      return (Right ((), atomically (takeTMVar callback)))
+  callback <- atomicallyE $ deleteRowSTM db name rowId
+  return ((), atomically (takeTMVar callback))
 
 -- | Drop a table, returning a durability waiter.
 asyncDrop :: Database -> TableName
-          -> IO (Either DbError ((), IO ()))
+          -> ExceptT DbError IO ((), IO ())
 asyncDrop db name = do
-  result <- atomically $ dropTableSTM db name
-  case result of
-    Left err -> return (Left err)
-    Right callback ->
-      return (Right ((), atomically (takeTMVar callback)))
+  callback <- atomicallyE $ dropTableSTM db name
+  return ((), atomically (takeTMVar callback))

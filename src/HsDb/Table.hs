@@ -14,10 +14,13 @@ module HsDb.Table
   , updateRow
   , deleteRow
   , validateRow
+  , lookupTable
   ) where
 
 import Control.Concurrent.STM
 import Control.Monad (when)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Except (ExceptT, throwE, except)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Map.Strict (Map)
@@ -43,28 +46,34 @@ type TableCatalog = TVar (Map TableName Table)
 newTableCatalog :: STM TableCatalog
 newTableCatalog = newTVar Map.empty
 
--- | Create a new table in the catalog.
-createTable :: TableCatalog -> TableName -> Schema -> STM (Either DbError Table)
-createTable catalog name schema = do
-  tables <- readTVar catalog
+-- | Look up a table by name, throwing 'TableNotFound' if absent.
+lookupTable :: TableCatalog -> TableName -> ExceptT DbError STM Table
+lookupTable catalog name = do
+  tables <- lift $ readTVar catalog
   case Map.lookup name tables of
-    Just _  -> return (Left (TableAlreadyExists name))
+    Nothing    -> throwE (TableNotFound name)
+    Just table -> return table
+
+-- | Create a new table in the catalog.
+createTable :: TableCatalog -> TableName -> Schema -> ExceptT DbError STM Table
+createTable catalog name schema = do
+  tables <- lift $ readTVar catalog
+  case Map.lookup name tables of
+    Just _  -> throwE (TableAlreadyExists name)
     Nothing -> do
-      rows    <- newTVar IntMap.empty
-      counter <- newTVar 0
+      rows    <- lift $ newTVar IntMap.empty
+      counter <- lift $ newTVar 0
       let table = Table schema rows counter
-      writeTVar catalog (Map.insert name table tables)
-      return (Right table)
+      lift $ writeTVar catalog (Map.insert name table tables)
+      return table
 
 -- | Drop a table from the catalog.
-dropTable :: TableCatalog -> TableName -> STM (Either DbError ())
+dropTable :: TableCatalog -> TableName -> ExceptT DbError STM ()
 dropTable catalog name = do
-  tables <- readTVar catalog
+  tables <- lift $ readTVar catalog
   case Map.lookup name tables of
-    Nothing -> return (Left (TableNotFound name))
-    Just _  -> do
-      writeTVar catalog (Map.delete name tables)
-      return (Right ())
+    Nothing -> throwE (TableNotFound name)
+    Just _  -> lift $ writeTVar catalog (Map.delete name tables)
 
 -- | Validate a row against a schema. Returns Nothing on success, or a
 -- description of the schema violation.
@@ -114,34 +123,28 @@ validateRow schema row
     valueTypeName VNull        = "Null"
 
 -- | Insert a row, auto-assigning a new row ID. Returns the assigned RowId.
-insertRow :: Table -> Vector Value -> STM (Either DbError RowId)
-insertRow table row =
-  case validateRow (tableSchema table) row of
-    Left err -> return (Left err)
-    Right () -> do
-      rid <- readTVar (tableCounter table)
-      let nextId = rid
-      modifyTVar' (tableCounter table) (+ 1)
-      modifyTVar' (tableRows table) (IntMap.insert nextId row)
-      return (Right nextId)
+insertRow :: Table -> Vector Value -> ExceptT DbError STM RowId
+insertRow table row = do
+  except $ validateRow (tableSchema table) row
+  rid <- lift $ readTVar (tableCounter table)
+  lift $ modifyTVar' (tableCounter table) (+ 1)
+  lift $ modifyTVar' (tableRows table) (IntMap.insert rid row)
+  return rid
 
 -- | Insert a row with a specific row ID (used during WAL replay).
 -- Rejects duplicate row IDs. Advances the counter to max(current, rowId + 1)
 -- to avoid ID reuse.
-insertRowWithId :: Table -> TableName -> RowId -> Vector Value -> STM (Either DbError ())
-insertRowWithId table tableName rowId row =
-  case validateRow (tableSchema table) row of
-    Left err -> return (Left err)
-    Right () -> do
-      rows <- readTVar (tableRows table)
-      if IntMap.member rowId rows
-        then return (Left (DuplicateRowId tableName rowId))
-        else do
-          writeTVar (tableRows table) (IntMap.insert rowId row rows)
-          counter <- readTVar (tableCounter table)
-          when (rowId >= counter) $
-            writeTVar (tableCounter table) (rowId + 1)
-          return (Right ())
+insertRowWithId :: Table -> TableName -> RowId -> Vector Value -> ExceptT DbError STM ()
+insertRowWithId table tableName rowId row = do
+  except $ validateRow (tableSchema table) row
+  rows <- lift $ readTVar (tableRows table)
+  if IntMap.member rowId rows
+    then throwE (DuplicateRowId tableName rowId)
+    else do
+      lift $ writeTVar (tableRows table) (IntMap.insert rowId row rows)
+      counter <- lift $ readTVar (tableCounter table)
+      when (rowId >= counter) $
+        lift $ writeTVar (tableCounter table) (rowId + 1)
 
 -- | Select all rows from a table.
 selectAll :: Table -> STM [(RowId, Row)]
@@ -150,24 +153,18 @@ selectAll table = do
   return (IntMap.toAscList rows)
 
 -- | Update an existing row.
-updateRow :: Table -> TableName -> RowId -> Vector Value -> STM (Either DbError ())
-updateRow table tableName rowId row =
-  case validateRow (tableSchema table) row of
-    Left err -> return (Left err)
-    Right () -> do
-      rows <- readTVar (tableRows table)
-      case IntMap.lookup rowId rows of
-        Nothing -> return (Left (RowNotFound tableName rowId))
-        Just _  -> do
-          writeTVar (tableRows table) (IntMap.insert rowId row rows)
-          return (Right ())
+updateRow :: Table -> TableName -> RowId -> Vector Value -> ExceptT DbError STM ()
+updateRow table tableName rowId row = do
+  except $ validateRow (tableSchema table) row
+  rows <- lift $ readTVar (tableRows table)
+  case IntMap.lookup rowId rows of
+    Nothing -> throwE (RowNotFound tableName rowId)
+    Just _  -> lift $ writeTVar (tableRows table) (IntMap.insert rowId row rows)
 
 -- | Delete a row by ID.
-deleteRow :: Table -> TableName -> RowId -> STM (Either DbError ())
+deleteRow :: Table -> TableName -> RowId -> ExceptT DbError STM ()
 deleteRow table tableName rowId = do
-  rows <- readTVar (tableRows table)
+  rows <- lift $ readTVar (tableRows table)
   case IntMap.lookup rowId rows of
-    Nothing -> return (Left (RowNotFound tableName rowId))
-    Just _  -> do
-      writeTVar (tableRows table) (IntMap.delete rowId rows)
-      return (Right ())
+    Nothing -> throwE (RowNotFound tableName rowId)
+    Just _  -> lift $ writeTVar (tableRows table) (IntMap.delete rowId rows)

@@ -6,6 +6,8 @@ import Hedgehog
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Control.Concurrent.STM
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Except (runExceptT)
 import qualified Data.Vector as V
 
 import HsDb.Types
@@ -38,8 +40,8 @@ prop_create_table :: Property
 prop_create_table = property $ do
   name <- forAll genTableName
   schema <- forAll genSchema
-  result <- evalIO $ atomically $ do
-    catalog <- newTableCatalog
+  result <- evalIO $ atomically $ runExceptT $ do
+    catalog <- lift newTableCatalog
     createTable catalog name schema
   table <- unwrapRight result
   tableSchema table === schema
@@ -48,8 +50,8 @@ prop_create_duplicate_table :: Property
 prop_create_duplicate_table = property $ do
   name <- forAll genTableName
   schema <- forAll genSchema
-  result <- evalIO $ atomically $ do
-    catalog <- newTableCatalog
+  result <- evalIO $ atomically $ runExceptT $ do
+    catalog <- lift newTableCatalog
     _ <- createTable catalog name schema
     createTable catalog name schema
   case result of
@@ -60,8 +62,8 @@ prop_create_duplicate_table = property $ do
 prop_drop_nonexistent :: Property
 prop_drop_nonexistent = property $ do
   name <- forAll genTableName
-  result <- evalIO $ atomically $ do
-    catalog <- newTableCatalog
+  result <- evalIO $ atomically $ runExceptT $ do
+    catalog <- lift newTableCatalog
     dropTable catalog name
   result === Left (TableNotFound name)
 
@@ -69,18 +71,13 @@ prop_insert_select_roundtrip :: Property
 prop_insert_select_roundtrip = property $ do
   schema <- forAll genSchema
   row <- forAll (genRowForSchema schema)
-  (rid, rows) <- evalIO $ atomically $ do
-    catalog <- newTableCatalog
-    res <- createTable catalog "test" schema
-    case res of
-      Left e  -> error (show e)
-      Right table -> do
-        res2 <- insertRow table row
-        case res2 of
-          Left e  -> error (show e)
-          Right rid -> do
-            rs <- selectAll table
-            return (rid, rs)
+  result <- evalIO $ atomically $ runExceptT $ do
+    catalog <- lift newTableCatalog
+    table <- createTable catalog "test" schema
+    rid <- insertRow table row
+    rs <- lift $ selectAll table
+    return (rid, rs)
+  (rid, rows) <- unwrapRight result
   rid === 0
   rows === [(0, row)]
 
@@ -89,18 +86,11 @@ prop_insert_assigns_unique_ids = property $ do
   schema <- forAll genSchema
   n <- forAll $ Gen.int (Range.linear 1 20)
   rowList <- forAll $ Gen.list (Range.singleton n) (genRowForSchema schema)
-  ids <- evalIO $ atomically $ do
-    catalog <- newTableCatalog
-    res <- createTable catalog "test" schema
-    case res of
-      Left e -> error (show e)
-      Right table ->
-        mapM (\r -> do
-          res2 <- insertRow table r
-          case res2 of
-            Left e  -> error (show e)
-            Right rid -> return rid
-          ) rowList
+  result <- evalIO $ atomically $ runExceptT $ do
+    catalog <- lift newTableCatalog
+    table <- createTable catalog "test" schema
+    mapM (insertRow table) rowList
+  ids <- unwrapRight result
   length ids === n
   ids === [0 .. n - 1]
 
@@ -109,51 +99,35 @@ prop_update_row = property $ do
   schema <- forAll genSchema
   row1 <- forAll (genRowForSchema schema)
   row2 <- forAll (genRowForSchema schema)
-  rows <- evalIO $ atomically $ do
-    catalog <- newTableCatalog
-    res <- createTable catalog "test" schema
-    case res of
-      Left e -> error (show e)
-      Right table -> do
-        res2 <- insertRow table row1
-        case res2 of
-          Left e -> error (show e)
-          Right rid -> do
-            res3 <- updateRow table "test" rid row2
-            case res3 of
-              Left e -> error (show e)
-              Right () -> selectAll table
+  result <- evalIO $ atomically $ runExceptT $ do
+    catalog <- lift newTableCatalog
+    table <- createTable catalog "test" schema
+    rid <- insertRow table row1
+    updateRow table "test" rid row2
+    lift $ selectAll table
+  rows <- unwrapRight result
   rows === [(0, row2)]
 
 prop_delete_row :: Property
 prop_delete_row = property $ do
   schema <- forAll genSchema
   row <- forAll (genRowForSchema schema)
-  rows <- evalIO $ atomically $ do
-    catalog <- newTableCatalog
-    res <- createTable catalog "test" schema
-    case res of
-      Left e -> error (show e)
-      Right table -> do
-        res2 <- insertRow table row
-        case res2 of
-          Left e -> error (show e)
-          Right rid -> do
-            res3 <- deleteRow table "test" rid
-            case res3 of
-              Left e -> error (show e)
-              Right () -> selectAll table
+  result <- evalIO $ atomically $ runExceptT $ do
+    catalog <- lift newTableCatalog
+    table <- createTable catalog "test" schema
+    rid <- insertRow table row
+    deleteRow table "test" rid
+    lift $ selectAll table
+  rows <- unwrapRight result
   rows === []
 
 prop_delete_nonexistent :: Property
 prop_delete_nonexistent = property $ do
   schema <- forAll genSchema
-  result <- evalIO $ atomically $ do
-    catalog <- newTableCatalog
-    res <- createTable catalog "test" schema
-    case res of
-      Left e -> error (show e)
-      Right table -> deleteRow table "test" 42
+  result <- evalIO $ atomically $ runExceptT $ do
+    catalog <- lift newTableCatalog
+    table <- createTable catalog "test" schema
+    deleteRow table "test" 42
   case result of
     Left (RowNotFound _ 42) -> success
     _ -> do annotateShow result; failure
@@ -186,19 +160,14 @@ prop_insert_with_id :: Property
 prop_insert_with_id = property $ do
   schema <- forAll genSchema
   row <- forAll (genRowForSchema schema)
-  (rows, nextId) <- evalIO $ atomically $ do
-    catalog <- newTableCatalog
-    res <- createTable catalog "test" schema
-    case res of
-      Left e -> error (show e)
-      Right table -> do
-        res2 <- insertRowWithId table "test" 42 row
-        case res2 of
-          Left e -> error (show e)
-          Right () -> do
-            rs <- selectAll table
-            counter <- readTVar (tableCounter table)
-            return (rs, counter)
+  result <- evalIO $ atomically $ runExceptT $ do
+    catalog <- lift newTableCatalog
+    table <- createTable catalog "test" schema
+    insertRowWithId table "test" 42 row
+    rs <- lift $ selectAll table
+    counter <- lift $ readTVar (tableCounter table)
+    return (rs, counter)
+  (rows, nextId) <- unwrapRight result
   rows === [(42, row)]
   nextId === 43
 
@@ -206,15 +175,10 @@ prop_drop_and_recreate :: Property
 prop_drop_and_recreate = property $ do
   schema1 <- forAll genSchema
   schema2 <- forAll genSchema
-  result <- evalIO $ atomically $ do
-    catalog <- newTableCatalog
-    res <- createTable catalog "test" schema1
-    case res of
-      Left e -> error (show e)
-      Right _ -> do
-        res2 <- dropTable catalog "test"
-        case res2 of
-          Left e -> error (show e)
-          Right () -> createTable catalog "test" schema2
+  result <- evalIO $ atomically $ runExceptT $ do
+    catalog <- lift newTableCatalog
+    _ <- createTable catalog "test" schema1
+    dropTable catalog "test"
+    createTable catalog "test" schema2
   table <- unwrapRight result
   tableSchema table === schema2

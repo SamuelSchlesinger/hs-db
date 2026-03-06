@@ -7,8 +7,8 @@ module HsDb.WAL.Replay
   ) where
 
 import Control.Concurrent.STM
+import Control.Monad.Trans.Except (ExceptT, runExceptT)
 import qualified Data.ByteString as BS
-import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word64)
@@ -64,36 +64,28 @@ replayEntries catalog bs lastSeq warnings
           then return (Left (WALSequenceError (T.pack ("Expected seq > "
                               ++ show lastSeq ++ ", got " ++ show seq'))))
           else do
-            result <- atomically $ applyCommand catalog (walCommand entry)
+            result <- atomically $ runExceptT $ applyCommand catalog (walCommand entry)
             case result of
               Left err -> return (Left err)
               Right () -> replayEntries catalog rest seq' warnings
 
 -- | Apply a single WAL command to the table catalog in STM.
-applyCommand :: TableCatalog -> WALCommand -> STM (Either DbError ())
+applyCommand :: TableCatalog -> WALCommand -> ExceptT DbError STM ()
 applyCommand catalog cmd = case cmd of
   CmdCreateTable name schema -> do
-    result <- createTable catalog name schema
-    case result of
-      Left err -> return (Left err)
-      Right _  -> return (Right ())
+    _ <- createTable catalog name schema
+    return ()
 
   CmdInsertRow name rowId row -> do
-    tables <- readTVar catalog
-    case Map.lookup name tables of
-      Nothing    -> return (Left (TableNotFound name))
-      Just table -> insertRowWithId table name rowId row
+    table <- lookupTable catalog name
+    insertRowWithId table name rowId row
 
   CmdUpdateRow name rowId row -> do
-    tables <- readTVar catalog
-    case Map.lookup name tables of
-      Nothing    -> return (Left (TableNotFound name))
-      Just table -> updateRow table name rowId row
+    table <- lookupTable catalog name
+    updateRow table name rowId row
 
   CmdDeleteRow name rowId -> do
-    tables <- readTVar catalog
-    case Map.lookup name tables of
-      Nothing    -> return (Left (TableNotFound name))
-      Just table -> deleteRow table name rowId
+    table <- lookupTable catalog name
+    deleteRow table name rowId
 
   CmdDropTable name -> dropTable catalog name

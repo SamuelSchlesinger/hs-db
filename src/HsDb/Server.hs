@@ -11,6 +11,7 @@ module HsDb.Server
 
 import Control.Concurrent (forkFinally)
 import Control.Exception (SomeException, catch, bracket)
+import Control.Monad.Trans.Except (runExceptT)
 import qualified Data.ByteString as BS
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -116,7 +117,7 @@ handleQuery h db sql
           sendErrorResponse h ("Parse error: " <> peMessage err)
           sendReadyForQuery h
         Right stmt -> do
-          result <- executeSQL db stmt
+          result <- runExceptT $ executeSQL db stmt
           case result of
             Left err -> do
               sendErrorResponse h err

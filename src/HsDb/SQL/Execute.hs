@@ -8,7 +8,9 @@ module HsDb.SQL.Execute
   , ColumnInfo(..)
   ) where
 
-import Control.Concurrent.STM (atomically, readTVar, takeTMVar)
+import Control.Concurrent.STM (STM, atomically, readTVar, takeTMVar)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Except (ExceptT, throwE, except, withExceptT)
 import Data.Int (Int32, Int64)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -18,7 +20,8 @@ import qualified Data.Vector as V
 
 import HsDb.Types
 import HsDb.Integration (Database(..), selectAllSTM, createTableSTM,
-                          insertRowSTM, updateRowSTM, deleteRowSTM, dropTableSTM)
+                          insertRowSTM, updateRowSTM, deleteRowSTM, dropTableSTM,
+                          atomicallyE)
 import HsDb.Table (Table(..), TableCatalog)
 import HsDb.SQL.Types as SQL
 
@@ -36,8 +39,12 @@ data QueryResult
     -- ^ SELECT result: column info + rows of text-formatted values (Nothing = NULL)
   deriving (Show, Eq)
 
+-- | Bridge ExceptT DbError STM to ExceptT Text IO.
+atomicallyDbError :: ExceptT DbError STM a -> ExceptT Text IO a
+atomicallyDbError = withExceptT (T.pack . show) . atomicallyE
+
 -- | Execute a parsed SQL statement against a Database.
-executeSQL :: Database -> Statement -> IO (Either Text QueryResult)
+executeSQL :: Database -> Statement -> ExceptT Text IO QueryResult
 executeSQL db stmt = case stmt of
   CreateTable name colDefs -> execCreateTable db name colDefs
   DropTable name           -> execDropTable db name
@@ -48,150 +55,94 @@ executeSQL db stmt = case stmt of
 
 -- CREATE TABLE
 
-execCreateTable :: Database -> Text -> [ColumnDef] -> IO (Either Text QueryResult)
+execCreateTable :: Database -> Text -> [ColumnDef] -> ExceptT Text IO QueryResult
 execCreateTable db name colDefs = do
   let schema = map columnDefToColumn colDefs
-  result <- atomically $ createTableSTM db name schema
-  case result of
-    Left err -> return (Left (T.pack (show err)))
-    Right (_, callback) -> do
-      atomically $ takeTMVar callback
-      return (Right (CommandComplete "CREATE TABLE"))
+  (_, callback) <- atomicallyDbError $ createTableSTM db name schema
+  lift $ atomically $ takeTMVar callback
+  return (CommandComplete "CREATE TABLE")
 
 -- DROP TABLE
 
-execDropTable :: Database -> Text -> IO (Either Text QueryResult)
+execDropTable :: Database -> Text -> ExceptT Text IO QueryResult
 execDropTable db name = do
-  result <- atomically $ dropTableSTM db name
-  case result of
-    Left err -> return (Left (T.pack (show err)))
-    Right callback -> do
-      atomically $ takeTMVar callback
-      return (Right (CommandComplete "DROP TABLE"))
+  callback <- atomicallyDbError $ dropTableSTM db name
+  lift $ atomically $ takeTMVar callback
+  return (CommandComplete "DROP TABLE")
 
 -- INSERT
 
-execInsert :: Database -> Text -> [Text] -> [[Literal]] -> IO (Either Text QueryResult)
+execInsert :: Database -> Text -> [Text] -> [[Literal]] -> ExceptT Text IO QueryResult
 execInsert db name cols valRows = do
-  -- Look up table schema to map column names to positions
-  schemaResult <- getTableSchema (dbCatalog db) name
-  case schemaResult of
-    Left err -> return (Left err)
-    Right schema -> do
-      -- Resolve column ordering
-      case resolveColumns schema cols of
-        Left err -> return (Left err)
-        Right colOrder -> do
-          -- Insert each row
-          count <- insertRows db name schema colOrder valRows 0
-          case count of
-            Left err -> return (Left err)
-            Right n  -> return (Right (CommandComplete ("INSERT 0 " <> T.pack (show n))))
+  schema <- getTableSchema (dbCatalog db) name
+  colOrder <- except $ resolveColumns schema cols
+  n <- insertRows db name schema colOrder valRows 0
+  return (CommandComplete ("INSERT 0 " <> T.pack (show n)))
 
 insertRows :: Database -> Text -> Schema -> [Int] -> [[Literal]] -> Int
-           -> IO (Either Text Int)
-insertRows _ _ _ _ [] n = return (Right n)
+           -> ExceptT Text IO Int
+insertRows _ _ _ _ [] n = return n
 insertRows db name schema colOrder (lits:rest) n = do
-  case buildRow schema colOrder lits of
-    Left err -> return (Left err)
-    Right row -> do
-      result <- atomically $ insertRowSTM db name row
-      case result of
-        Left err -> return (Left (T.pack (show err)))
-        Right (_, callback) -> do
-          atomically $ takeTMVar callback
-          insertRows db name schema colOrder rest (n + 1)
+  row <- except $ buildRow schema colOrder lits
+  (_, callback) <- atomicallyDbError $ insertRowSTM db name row
+  lift $ atomically $ takeTMVar callback
+  insertRows db name schema colOrder rest (n + 1)
 
 -- SELECT
 
 execSelect :: Database -> Text -> [SelectTarget] -> Maybe Expr
-           -> IO (Either Text QueryResult)
+           -> ExceptT Text IO QueryResult
 execSelect db name targets wh = do
-  schemaResult <- getTableSchema (dbCatalog db) name
-  case schemaResult of
-    Left err -> return (Left err)
-    Right schema -> do
-      result <- atomically $ selectAllSTM db name
-      case result of
-        Left err -> return (Left (T.pack (show err)))
-        Right rows -> do
-          -- Resolve target columns
-          let (colInfos, colIdxs) = resolveSelectTargets schema targets
-          -- Filter by WHERE
-          let filtered = case wh of
-                Nothing -> rows
-                Just expr -> filter (\(_, row) -> evalWhere schema expr row) rows
-          -- Project columns
-          let projected = map (\(_, row) -> projectRow colIdxs row) filtered
-          -- Format as text
-          let textRows = map (map formatValue) projected
-          return (Right (RowResult colInfos textRows))
+  schema <- getTableSchema (dbCatalog db) name
+  rows <- atomicallyDbError $ selectAllSTM db name
+  let (colInfos, colIdxs) = resolveSelectTargets schema targets
+  let filtered = case wh of
+        Nothing -> rows
+        Just expr -> filter (\(_, row) -> evalWhere schema expr row) rows
+  let projected = map (\(_, row) -> projectRow colIdxs row) filtered
+  let textRows = map (map formatValue) projected
+  return (RowResult colInfos textRows)
 
 -- UPDATE
 
 execUpdate :: Database -> Text -> [(Text, Expr)] -> Maybe Expr
-           -> IO (Either Text QueryResult)
+           -> ExceptT Text IO QueryResult
 execUpdate db name assigns wh = do
-  schemaResult <- getTableSchema (dbCatalog db) name
-  case schemaResult of
-    Left err -> return (Left err)
-    Right schema -> do
-      result <- atomically $ selectAllSTM db name
-      case result of
-        Left err -> return (Left (T.pack (show err)))
-        Right rows -> do
-          let matching = case wh of
-                Nothing -> rows
-                Just expr -> filter (\(_, row) -> evalWhere schema expr row) rows
-          -- Apply updates
-          count <- updateRows db name schema assigns matching 0
-          case count of
-            Left err -> return (Left err)
-            Right n  -> return (Right (CommandComplete ("UPDATE " <> T.pack (show n))))
+  schema <- getTableSchema (dbCatalog db) name
+  rows <- atomicallyDbError $ selectAllSTM db name
+  let matching = case wh of
+        Nothing -> rows
+        Just expr -> filter (\(_, row) -> evalWhere schema expr row) rows
+  n <- updateRows db name schema assigns matching 0
+  return (CommandComplete ("UPDATE " <> T.pack (show n)))
 
 updateRows :: Database -> Text -> Schema -> [(Text, Expr)] -> [(RowId, Row)] -> Int
-           -> IO (Either Text Int)
-updateRows _ _ _ _ [] n = return (Right n)
+           -> ExceptT Text IO Int
+updateRows _ _ _ _ [] n = return n
 updateRows db name schema assigns ((rowId, row):rest) n = do
-  case applyAssignments schema assigns row of
-    Left err -> return (Left err)
-    Right newRow -> do
-      result <- atomically $ updateRowSTM db name rowId newRow
-      case result of
-        Left err -> return (Left (T.pack (show err)))
-        Right callback -> do
-          atomically $ takeTMVar callback
-          updateRows db name schema assigns rest (n + 1)
+  newRow <- except $ applyAssignments schema assigns row
+  callback <- atomicallyDbError $ updateRowSTM db name rowId newRow
+  lift $ atomically $ takeTMVar callback
+  updateRows db name schema assigns rest (n + 1)
 
 -- DELETE
 
-execDelete :: Database -> Text -> Maybe Expr -> IO (Either Text QueryResult)
+execDelete :: Database -> Text -> Maybe Expr -> ExceptT Text IO QueryResult
 execDelete db name wh = do
-  schemaResult <- getTableSchema (dbCatalog db) name
-  case schemaResult of
-    Left err -> return (Left err)
-    Right schema -> do
-      result <- atomically $ selectAllSTM db name
-      case result of
-        Left err -> return (Left (T.pack (show err)))
-        Right rows -> do
-          let matching = case wh of
-                Nothing -> rows
-                Just expr -> filter (\(_, row) -> evalWhere schema expr row) rows
-          count <- deleteRows db name matching 0
-          case count of
-            Left err -> return (Left err)
-            Right n  -> return (Right (CommandComplete ("DELETE " <> T.pack (show n))))
+  schema <- getTableSchema (dbCatalog db) name
+  rows <- atomicallyDbError $ selectAllSTM db name
+  let matching = case wh of
+        Nothing -> rows
+        Just expr -> filter (\(_, row) -> evalWhere schema expr row) rows
+  n <- deleteRows db name matching 0
+  return (CommandComplete ("DELETE " <> T.pack (show n)))
 
-deleteRows :: Database -> Text -> [(RowId, Row)] -> Int -> IO (Either Text Int)
-deleteRows _ _ [] n = return (Right n)
+deleteRows :: Database -> Text -> [(RowId, Row)] -> Int -> ExceptT Text IO Int
+deleteRows _ _ [] n = return n
 deleteRows db name ((rowId, _):rest) n = do
-  result <- atomically $ deleteRowSTM db name rowId
-  case result of
-    Left err -> return (Left (T.pack (show err)))
-    Right callback -> do
-      atomically $ takeTMVar callback
-      deleteRows db name rest (n + 1)
+  callback <- atomicallyDbError $ deleteRowSTM db name rowId
+  lift $ atomically $ takeTMVar callback
+  deleteRows db name rest (n + 1)
 
 -- Helpers
 
@@ -210,12 +161,12 @@ sqlTypeToColumnType SqlText   = TText
 sqlTypeToColumnType SqlBool   = TBool
 sqlTypeToColumnType SqlBytea  = TBytea
 
-getTableSchema :: TableCatalog -> Text -> IO (Either Text Schema)
+getTableSchema :: TableCatalog -> Text -> ExceptT Text IO Schema
 getTableSchema catalog name = do
-  tables <- atomically $ readTVar catalog
+  tables <- lift $ atomically $ readTVar catalog
   case Map.lookup name tables of
-    Nothing    -> return (Left ("Table '" <> name <> "' does not exist"))
-    Just table -> return (Right (tableSchema table))
+    Nothing    -> throwE ("Table '" <> name <> "' does not exist")
+    Just table -> return (tableSchema table)
 
 -- Map column names from INSERT to schema positions.
 -- Returns a list of schema indices in the order given by the INSERT column list.

@@ -11,11 +11,13 @@ module HsDb.Integration
   , deleteRowSTM
   , dropTableSTM
   , selectAllSTM
+  , atomicallyE
   ) where
 
 import Control.Concurrent.MVar (MVar)
 import Control.Concurrent.STM
-import qualified Data.Map.Strict as Map
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Except (ExceptT(..), throwE, runExceptT)
 import Data.Vector (Vector)
 
 import HsDb.Types
@@ -32,111 +34,74 @@ data Database = Database
   , dbShutdownOnce :: !(MVar ())            -- ^ Guards against concurrent closeDatabase
   }
 
+-- | Run an 'ExceptT' over STM atomically, bridging to IO.
+atomicallyE :: ExceptT e STM a -> ExceptT e IO a
+atomicallyE = ExceptT . atomically . runExceptT
+
 -- | Check that the database is writable before performing a mutation.
-checkWritable :: Database -> STM (Either DbError ())
+checkWritable :: Database -> ExceptT DbError STM ()
 checkWritable db = do
-  st <- readTVar (dbStatus db)
+  st <- lift $ readTVar (dbStatus db)
   case st of
-    DbWritable     -> return (Right ())
-    DbReadOnly msg -> return (Left (DatabaseNotWritable msg))
-    DbShuttingDown -> return (Left (DatabaseNotWritable "Database is shutting down"))
+    DbWritable     -> return ()
+    DbReadOnly msg -> throwE (DatabaseNotWritable msg)
+    DbShuttingDown -> throwE (DatabaseNotWritable "Database is shutting down")
 
 -- | Create a table and enqueue the WAL command in one STM transaction.
 createTableSTM :: Database -> TableName -> Schema
-               -> STM (Either DbError (Table, TMVar ()))
+               -> ExceptT DbError STM (Table, TMVar ())
 createTableSTM db name schema = do
-  writable <- checkWritable db
-  case writable of
-    Left err -> return (Left err)
-    Right () -> do
-      result <- createTable (dbCatalog db) name schema
-      case result of
-        Left err -> return (Left err)
-        Right table -> do
-          callback <- newEmptyTMVar
-          writeTBQueue (dbQueue db) (CmdCreateTable name schema, callback)
-          return (Right (table, callback))
+  checkWritable db
+  table <- createTable (dbCatalog db) name schema
+  callback <- lift newEmptyTMVar
+  lift $ writeTBQueue (dbQueue db) (CmdCreateTable name schema, callback)
+  return (table, callback)
 
 -- | Insert a row and enqueue the WAL command in one STM transaction.
 insertRowSTM :: Database -> TableName -> Vector Value
-             -> STM (Either DbError (RowId, TMVar ()))
+             -> ExceptT DbError STM (RowId, TMVar ())
 insertRowSTM db name row = do
-  writable <- checkWritable db
-  case writable of
-    Left err -> return (Left err)
-    Right () -> do
-      tables <- readTVar (dbCatalog db)
-      case Map.lookup name tables of
-        Nothing -> return (Left (TableNotFound name))
-        Just table -> do
-          result <- insertRow table row
-          case result of
-            Left err -> return (Left err)
-            Right rowId -> do
-              callback <- newEmptyTMVar
-              writeTBQueue (dbQueue db) (CmdInsertRow name rowId row, callback)
-              return (Right (rowId, callback))
+  checkWritable db
+  table <- lookupTable (dbCatalog db) name
+  rowId <- insertRow table row
+  callback <- lift newEmptyTMVar
+  lift $ writeTBQueue (dbQueue db) (CmdInsertRow name rowId row, callback)
+  return (rowId, callback)
 
 -- | Update a row and enqueue the WAL command in one STM transaction.
 updateRowSTM :: Database -> TableName -> RowId -> Vector Value
-             -> STM (Either DbError (TMVar ()))
+             -> ExceptT DbError STM (TMVar ())
 updateRowSTM db name rowId row = do
-  writable <- checkWritable db
-  case writable of
-    Left err -> return (Left err)
-    Right () -> do
-      tables <- readTVar (dbCatalog db)
-      case Map.lookup name tables of
-        Nothing -> return (Left (TableNotFound name))
-        Just table -> do
-          result <- updateRow table name rowId row
-          case result of
-            Left err -> return (Left err)
-            Right () -> do
-              callback <- newEmptyTMVar
-              writeTBQueue (dbQueue db) (CmdUpdateRow name rowId row, callback)
-              return (Right callback)
+  checkWritable db
+  table <- lookupTable (dbCatalog db) name
+  updateRow table name rowId row
+  callback <- lift newEmptyTMVar
+  lift $ writeTBQueue (dbQueue db) (CmdUpdateRow name rowId row, callback)
+  return callback
 
 -- | Delete a row and enqueue the WAL command in one STM transaction.
 deleteRowSTM :: Database -> TableName -> RowId
-             -> STM (Either DbError (TMVar ()))
+             -> ExceptT DbError STM (TMVar ())
 deleteRowSTM db name rowId = do
-  writable <- checkWritable db
-  case writable of
-    Left err -> return (Left err)
-    Right () -> do
-      tables <- readTVar (dbCatalog db)
-      case Map.lookup name tables of
-        Nothing -> return (Left (TableNotFound name))
-        Just table -> do
-          result <- deleteRow table name rowId
-          case result of
-            Left err -> return (Left err)
-            Right () -> do
-              callback <- newEmptyTMVar
-              writeTBQueue (dbQueue db) (CmdDeleteRow name rowId, callback)
-              return (Right callback)
+  checkWritable db
+  table <- lookupTable (dbCatalog db) name
+  deleteRow table name rowId
+  callback <- lift newEmptyTMVar
+  lift $ writeTBQueue (dbQueue db) (CmdDeleteRow name rowId, callback)
+  return callback
 
 -- | Drop a table and enqueue the WAL command in one STM transaction.
 dropTableSTM :: Database -> TableName
-             -> STM (Either DbError (TMVar ()))
+             -> ExceptT DbError STM (TMVar ())
 dropTableSTM db name = do
-  writable <- checkWritable db
-  case writable of
-    Left err -> return (Left err)
-    Right () -> do
-      result <- dropTable (dbCatalog db) name
-      case result of
-        Left err -> return (Left err)
-        Right () -> do
-          callback <- newEmptyTMVar
-          writeTBQueue (dbQueue db) (CmdDropTable name, callback)
-          return (Right callback)
+  checkWritable db
+  dropTable (dbCatalog db) name
+  callback <- lift newEmptyTMVar
+  lift $ writeTBQueue (dbQueue db) (CmdDropTable name, callback)
+  return callback
 
 -- | Select all rows from a table (pure STM read, no WAL involvement).
-selectAllSTM :: Database -> TableName -> STM (Either DbError [(RowId, Row)])
+selectAllSTM :: Database -> TableName -> ExceptT DbError STM [(RowId, Row)]
 selectAllSTM db name = do
-  tables <- readTVar (dbCatalog db)
-  case Map.lookup name tables of
-    Nothing    -> return (Left (TableNotFound name))
-    Just table -> Right <$> selectAll table
+  table <- lookupTable (dbCatalog db) name
+  lift $ selectAll table

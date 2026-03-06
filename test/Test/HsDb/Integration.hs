@@ -6,6 +6,7 @@ import Hedgehog
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (readMVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
+import Control.Monad.Trans.Except (runExceptT)
 import qualified Data.Vector as V
 import System.FilePath ((</>))
 import System.IO (hClose)
@@ -43,9 +44,9 @@ prop_create_insert_select = withTests 10 $ property $ do
   (rowId, rows) <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     withDatabase config $ \db -> do
-      expectRight =<< durableCreateTable db "users" schema
-      rid <- expectRight =<< durableInsert db "users" row
-      rs <- expectRight =<< selectAll db "users"
+      expectRight =<< runExceptT (durableCreateTable db "users" schema)
+      rid <- expectRight =<< runExceptT (durableInsert db "users" row)
+      rs <- expectRight =<< runExceptT (selectAll db "users")
       return (rid, rs)
   rowId === 0
   rows === [(0, row)]
@@ -59,13 +60,13 @@ prop_durability_roundtrip = withTests 5 $ property $ do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     -- Session 1: write data
     _ <- withDatabase config $ \db -> do
-      expectRight =<< durableCreateTable db "t" schema
-      _ <- expectRight =<< durableInsert db "t" row1
-      _ <- expectRight =<< durableInsert db "t" row2
+      expectRight =<< runExceptT (durableCreateTable db "t" schema)
+      _ <- expectRight =<< runExceptT (durableInsert db "t" row1)
+      _ <- expectRight =<< runExceptT (durableInsert db "t" row2)
       return ()
     -- Session 2: reopen and verify data survived
     withDatabase config $ \db ->
-      expectRight =<< selectAll db "t"
+      expectRight =<< runExceptT (selectAll db "t")
   rows === [(0, row1), (1, row2)]
 
 prop_concurrent_inserts :: Property
@@ -75,12 +76,12 @@ prop_concurrent_inserts = withTests 5 $ property $ do
   ids <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     withDatabase config $ \db -> do
-      expectRight =<< durableCreateTable db "t" schema
+      expectRight =<< runExceptT (durableCreateTable db "t" schema)
       results <- newTVarIO ([] :: [Either DbError RowId])
       dones <- mapM (\i -> do
         done <- newEmptyTMVarIO
         _ <- forkIO $ do
-          r <- durableInsert db "t" (V.fromList [VInt32 (fromIntegral i)])
+          r <- runExceptT $ durableInsert db "t" (V.fromList [VInt32 (fromIntegral i)])
           atomically $ modifyTVar' results (r :)
           atomically $ putTMVar done ()
         return done
@@ -103,12 +104,12 @@ prop_drop_recreate = withTests 5 $ property $ do
   rows <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     withDatabase config $ \db -> do
-      expectRight =<< durableCreateTable db "t" schema1
-      _ <- expectRight =<< durableInsert db "t" (V.fromList [VInt32 1])
-      expectRight =<< durableDrop db "t"
-      expectRight =<< durableCreateTable db "t" schema2
-      _ <- expectRight =<< durableInsert db "t" (V.fromList [VText "hello"])
-      expectRight =<< selectAll db "t"
+      expectRight =<< runExceptT (durableCreateTable db "t" schema1)
+      _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 1]))
+      expectRight =<< runExceptT (durableDrop db "t")
+      expectRight =<< runExceptT (durableCreateTable db "t" schema2)
+      _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VText "hello"]))
+      expectRight =<< runExceptT (selectAll db "t")
   rows === [(0, V.fromList [VText "hello"])]
 
 prop_update_delete_lifecycle :: Property
@@ -117,12 +118,12 @@ prop_update_delete_lifecycle = withTests 5 $ property $ do
   rows <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     withDatabase config $ \db -> do
-      expectRight =<< durableCreateTable db "t" schema
-      r0 <- expectRight =<< durableInsert db "t" (V.fromList [VInt32 1])
-      r1 <- expectRight =<< durableInsert db "t" (V.fromList [VInt32 2])
-      expectRight =<< durableUpdate db "t" r0 (V.fromList [VInt32 10])
-      expectRight =<< durableDelete db "t" r1
-      expectRight =<< selectAll db "t"
+      expectRight =<< runExceptT (durableCreateTable db "t" schema)
+      r0 <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 1]))
+      r1 <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 2]))
+      expectRight =<< runExceptT (durableUpdate db "t" r0 (V.fromList [VInt32 10]))
+      expectRight =<< runExceptT (durableDelete db "t" r1)
+      expectRight =<< runExceptT (selectAll db "t")
   rows === [(0, V.fromList [VInt32 10])]
 
 prop_withDatabase_cleanup :: Property
@@ -130,12 +131,12 @@ prop_withDatabase_cleanup = withTests 5 $ property $ do
   result <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     _ <- withDatabase config $ \db -> do
-      expectRight =<< durableCreateTable db "t" [Column "x" TInt32 False]
-      _ <- expectRight =<< durableInsert db "t" (V.fromList [VInt32 1])
+      expectRight =<< runExceptT (durableCreateTable db "t" [Column "x" TInt32 False])
+      _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 1]))
       return ()
     -- Reopen: data should persist
     withDatabase config $ \db ->
-      expectRight =<< selectAll db "t"
+      expectRight =<< runExceptT (selectAll db "t")
   result === [(0, V.fromList [VInt32 1])]
 
 prop_async_variants :: Property
@@ -144,11 +145,11 @@ prop_async_variants = withTests 5 $ property $ do
   rows <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     withDatabase config $ \db -> do
-      r1 <- expectRight =<< asyncCreateTable db "t" schema
+      r1 <- expectRight =<< runExceptT (asyncCreateTable db "t" schema)
       snd r1  -- wait for durability
-      r2 <- expectRight =<< asyncInsert db "t" (V.fromList [VInt32 42])
+      r2 <- expectRight =<< runExceptT (asyncInsert db "t" (V.fromList [VInt32 42]))
       snd r2  -- wait for durability
-      expectRight =<< selectAll db "t"
+      expectRight =<< runExceptT (selectAll db "t")
   rows === [(0, V.fromList [VInt32 42])]
 
 prop_flusher_crash_readonly :: Property
@@ -157,8 +158,8 @@ prop_flusher_crash_readonly = withTests 5 $ property $ do
   writeResult <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     db <- openDatabase config
-    expectRight =<< durableCreateTable db "t" schema
-    _ <- expectRight =<< durableInsert db "t" (V.fromList [VInt32 1])
+    expectRight =<< runExceptT (durableCreateTable db "t" schema)
+    _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 1]))
     -- Sabotage: close the WAL file handle to crash the flusher on next write
     walHandle <- readMVar (dbWALHandle db)
     hClose (walFileHandle walHandle)
@@ -166,7 +167,7 @@ prop_flusher_crash_readonly = withTests 5 $ property $ do
     -- try to write to the closed handle, catch the error, signal the callback,
     -- and transition to read-only. durableInsert itself may return Right since
     -- the callback gets signaled even on error.
-    _ <- durableInsert db "t" (V.fromList [VInt32 2])
+    _ <- runExceptT $ durableInsert db "t" (V.fromList [VInt32 2])
     -- Wait for flusher to transition to read-only (deterministic, no threadDelay)
     transitioned <- timeout 5000000 $ atomically $ do
       st <- readTVar (dbStatus db)
@@ -177,7 +178,7 @@ prop_flusher_crash_readonly = withTests 5 $ property $ do
       Nothing -> error "Timed out waiting for flusher to transition to read-only"
       Just () -> return ()
     -- Now the DB should be read-only; subsequent writes should fail
-    durableInsert db "t" (V.fromList [VInt32 3])
+    runExceptT $ durableInsert db "t" (V.fromList [VInt32 3])
   case writeResult of
     Left (DatabaseNotWritable _) -> success
     other -> do annotateShow other; failure
@@ -188,9 +189,9 @@ prop_deterministic_shutdown = withTests 5 $ property $ do
   evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     db <- openDatabase config
-    expectRight =<< durableCreateTable db "t" [Column "x" TInt32 False]
-    _ <- expectRight =<< durableInsert db "t" (V.fromList [VInt32 1])
-    _ <- expectRight =<< durableInsert db "t" (V.fromList [VInt32 2])
+    expectRight =<< runExceptT (durableCreateTable db "t" [Column "x" TInt32 False])
+    _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 1]))
+    _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 2]))
     -- closeDatabase should block on walDone and complete deterministically
     closeDatabase db
     -- If we get here, shutdown was deterministic (no hangs)
@@ -200,12 +201,12 @@ prop_deterministic_shutdown = withTests 5 $ property $ do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     -- Write + close
     db <- openDatabase config
-    expectRight =<< durableCreateTable db "t" [Column "x" TInt32 False]
-    _ <- expectRight =<< durableInsert db "t" (V.fromList [VInt32 1])
+    expectRight =<< runExceptT (durableCreateTable db "t" [Column "x" TInt32 False])
+    _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 1]))
     closeDatabase db
     -- Reopen and read
     db2 <- openDatabase config
-    result <- expectRight =<< selectAll db2 "t"
+    result <- expectRight =<< runExceptT (selectAll db2 "t")
     closeDatabase db2
     return result
   rows === [(0, V.fromList [VInt32 1])]
@@ -215,8 +216,8 @@ prop_concurrent_close_no_deadlock = withTests 5 $ property $ do
   result <- evalIO $ withSystemTempDirectory "hs-db-test" $ \dir -> do
     let config = defaultDatabaseConfig (dir </> "test.wal")
     db <- openDatabase config
-    expectRight =<< durableCreateTable db "t" [Column "x" TInt32 False]
-    _ <- expectRight =<< durableInsert db "t" (V.fromList [VInt32 1])
+    expectRight =<< runExceptT (durableCreateTable db "t" [Column "x" TInt32 False])
+    _ <- expectRight =<< runExceptT (durableInsert db "t" (V.fromList [VInt32 1]))
     -- Launch two concurrent close calls with a timeout to detect deadlocks
     done1 <- newEmptyMVar
     done2 <- newEmptyMVar
