@@ -10,6 +10,9 @@ module HsDb.SQL.Types
   , SortOrder(..)
   , OrderByClause(..)
   , AggFunc(..)
+  , FromClause(..)
+  , JoinType(..)
+  , InRHS(..)
   ) where
 
 import Data.Text (Text)
@@ -22,8 +25,8 @@ data Statement
     -- ^ @DROP TABLE name@
   | Insert !Text [Text] [[Literal]]
     -- ^ table, column names, rows of values
-  | Select !Bool [SelectTarget] !Text (Maybe Expr) [OrderByClause] (Maybe Int) (Maybe Int)
-    -- ^ DISTINCT flag, columns (or star), table, WHERE, ORDER BY, LIMIT, OFFSET
+  | Select !Bool [SelectTarget] FromClause (Maybe Expr) [Expr] (Maybe Expr) [OrderByClause] (Maybe Int) (Maybe Int)
+    -- ^ DISTINCT flag, columns (or star), from clause, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET
   | Update !Text [(Text, Expr)] (Maybe Expr)
     -- ^ table, SET assignments, optional WHERE
   | Delete !Text (Maybe Expr)
@@ -40,11 +43,8 @@ data Statement
 -- | What columns a SELECT targets.
 data SelectTarget
   = Star
-  | Column !Text
-  | ColumnAs !Text !Text
-    -- ^ column name, alias
-  | Agg !AggFunc !(Maybe Text)
-    -- ^ aggregate function, optional alias
+  | SelExpr Expr (Maybe Text)
+    -- ^ arbitrary expression, optional alias
   deriving (Show, Eq)
 
 -- | Aggregate functions.
@@ -62,6 +62,18 @@ data SortOrder = Asc | Desc deriving (Show, Eq)
 
 -- | A single ORDER BY clause: column name and sort direction.
 data OrderByClause = OrderByClause !Text !SortOrder
+  deriving (Show, Eq)
+
+-- | JOIN types.
+data JoinType = InnerJoin | LeftJoin | RightJoin | CrossJoin
+  deriving (Show, Eq)
+
+-- | FROM clause source.
+data FromClause
+  = FromTable !Text !(Maybe Text)
+    -- ^ table name, optional alias
+  | FromJoin !JoinType FromClause FromClause (Maybe Expr)
+    -- ^ join type, left, right, ON condition
   deriving (Show, Eq)
 
 -- | SQL column definition in CREATE TABLE.
@@ -103,6 +115,11 @@ data BinOp
   | OpOr
   | OpLike
   | OpILike
+  | OpAdd
+  | OpSub
+  | OpMul
+  | OpDiv
+  | OpMod
   deriving (Show, Eq)
 
 -- | SQL expressions (WHERE clauses, value expressions).
@@ -112,6 +129,16 @@ data Expr
   | ExprBinOp !BinOp Expr Expr
   | ExprIsNull Expr
   | ExprIsNotNull Expr
-  | ExprIn Expr [Expr]
+  | ExprIn Expr InRHS
   | ExprNot Expr
+  | ExprBetween Expr Expr Expr
+  | ExprAgg AggFunc
+  | ExprQualColumn !Text !Text
+    -- ^ qualifier.column
+  deriving (Show, Eq)
+
+-- | Right-hand side of IN expression.
+data InRHS
+  = InList [Expr]
+  | InSubquery Statement
   deriving (Show, Eq)

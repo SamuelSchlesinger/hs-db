@@ -20,6 +20,7 @@ import qualified Data.Set as Set
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Read as TR
 import qualified Data.Map.Strict as Map
 import Data.Vector (Vector)
 import qualified Data.Vector as V
@@ -33,6 +34,15 @@ import HsDb.Integration (Database(..), selectAllSTM, createTableSTM,
 import HsDb.Table (Table(..), TableCatalog, validateRow)
 import HsDb.Transaction
 import HsDb.SQL.Types as SQL
+
+fromTableName :: FromClause -> Text
+fromTableName (FromTable name _) = name
+fromTableName (FromJoin _ left _ _) = fromTableName left
+
+fromAlias :: FromClause -> Text
+fromAlias (FromTable _ (Just alias)) = alias
+fromAlias (FromTable name Nothing) = name
+fromAlias (FromJoin _ left _ _) = fromAlias left
 
 -- | Column metadata for result sets.
 data ColumnInfo = ColumnInfo
@@ -59,8 +69,8 @@ executeSQL db mtx stmt = case stmt of
   CreateTable name colDefs -> execCreateTable db mtx name colDefs
   DropTable name           -> execDropTable db mtx name
   Insert name cols valRows -> execInsert db mtx name cols valRows
-  Select dist targets name wh orderBy limit offset
-                             -> execSelect db mtx dist name targets wh orderBy limit offset
+  Select dist targets from' wh groupBy having' orderBy limit offset
+                             -> execSelect db mtx dist from' targets wh groupBy having' orderBy limit offset
   Update name assigns wh   -> execUpdate db mtx name assigns wh
   Delete name wh           -> execDelete db mtx name wh
   AlterTableAddColumn name colDef -> execAlterAddColumn db mtx name colDef
@@ -135,23 +145,81 @@ insertRowsTx tx name schema colOrder (lits:rest) n = do
 
 -- SELECT
 
-execSelect :: Database -> Maybe TxState -> Bool -> Text -> [SelectTarget] -> Maybe Expr
-           -> [OrderByClause] -> Maybe Int -> Maybe Int
+resolveFrom :: Database -> Maybe TxState -> FromClause -> ExceptT Text IO (Schema, [(RowId, Row)])
+resolveFrom db mtx (FromTable name _) = case mtx of
+  Nothing -> do
+    s <- getTableSchema (dbCatalog db) name
+    r <- atomicallyDbError $ selectAllSTM db name
+    return (s, r)
+  Just tx -> do
+    s <- lift (effectiveSchema (dbCatalog db) tx name) >>= liftEither
+    r <- lift (effectiveRows (dbCatalog db) tx name) >>= liftEither
+    return (s, r)
+resolveFrom db mtx (FromJoin jtype leftFrom rightFrom mCond) = do
+  (leftSchema, leftRows) <- resolveFrom db mtx leftFrom
+  (rightSchema, rightRows) <- resolveFrom db mtx rightFrom
+  let leftPrefix = fromAlias leftFrom
+      rightPrefix = fromAlias rightFrom
+      prefixSchema prefix schema = V.map (\c -> c { columnName = prefix <> "." <> columnName c }) schema
+      mergedSchema = prefixSchema leftPrefix leftSchema V.++ prefixSchema rightPrefix rightSchema
+      leftLen = V.length leftSchema
+      rightLen = V.length rightSchema
+      nullRight = V.replicate rightLen VNull
+      nullLeft = V.replicate leftLen VNull
+      crossProduct = [(0, lr V.++ rr) | (_, lr) <- leftRows, (_, rr) <- rightRows]
+      filterOn rows = case mCond of
+        Nothing -> rows
+        Just cond -> filter (\(_, row) -> evalWhere mergedSchema cond row) rows
+  case jtype of
+    CrossJoin -> return (mergedSchema, crossProduct)
+    InnerJoin -> return (mergedSchema, filterOn crossProduct)
+    LeftJoin -> do
+      let result = concatMap (\(_, lr) ->
+            let matches = [rr | (_, rr) <- rightRows,
+                           maybe True (\c -> evalWhere mergedSchema c (lr V.++ rr)) mCond]
+            in if null matches
+               then [(0, lr V.++ nullRight)]
+               else [(0, lr V.++ rr) | rr <- matches]
+            ) leftRows
+      return (mergedSchema, result)
+    RightJoin -> do
+      let result = concatMap (\(_, rr) ->
+            let matches = [lr | (_, lr) <- leftRows,
+                           maybe True (\c -> evalWhere mergedSchema c (lr V.++ rr)) mCond]
+            in if null matches
+               then [(0, nullLeft V.++ rr)]
+               else [(0, lr V.++ rr) | lr <- matches]
+            ) rightRows
+      return (mergedSchema, result)
+
+execSelect :: Database -> Maybe TxState -> Bool -> FromClause -> [SelectTarget] -> Maybe Expr
+           -> [Expr] -> Maybe Expr -> [OrderByClause] -> Maybe Int -> Maybe Int
            -> ExceptT Text IO QueryResult
-execSelect db mtx dist name targets wh orderBy mLimit mOffset = do
-  (schema, rows) <- case mtx of
-    Nothing -> do
-      s <- getTableSchema (dbCatalog db) name
-      r <- atomicallyDbError $ selectAllSTM db name
-      return (s, r)
-    Just tx -> do
-      s <- lift (effectiveSchema (dbCatalog db) tx name) >>= liftEither
-      r <- lift (effectiveRows (dbCatalog db) tx name) >>= liftEither
-      return (s, r)
-  let filtered = filterRows schema wh rows
-  -- Check if we have aggregates
+execSelect db mtx dist from' targets wh groupByExprs mHaving orderBy mLimit mOffset = do
+  (schema, rows) <- resolveFrom db mtx from'
+  wh' <- case wh of
+    Nothing -> return Nothing
+    Just expr -> Just <$> preEvalSubqueries db mtx expr
+  let filtered = filterRows schema wh' rows
+  -- Check if we have aggregates or GROUP BY
   let hasAgg = any isAggTarget targets
-  if hasAgg
+  if not (null groupByExprs)
+    then do
+      -- GROUP BY path
+      let groups = groupRows schema groupByExprs filtered
+      (colInfos, groupedRows) <- except $ computeGroupBy schema targets groupByExprs groups
+      -- Apply HAVING
+      let afterHaving = case mHaving of
+            Nothing -> groupedRows
+            Just hExpr -> filter (\(_, vals) -> case Map.lookup (descExpr hExpr) vals of
+              Just (VBool True) -> True
+              _ -> evalHaving hExpr vals) groupedRows
+      -- Convert to result rows
+      let resultRows = map fst afterHaving
+      let textRows = map (map formatValue) resultRows
+      let deduped = if dist then ordNub textRows else textRows
+      return (RowResult colInfos deduped)
+    else if hasAgg
     then do
       (colInfos, aggRow) <- except $ computeAggregates schema targets filtered
       return (RowResult colInfos [aggRow])
@@ -164,7 +232,7 @@ execSelect db mtx dist name targets wh orderBy mLimit mOffset = do
           return (sortRows orderIdxs filtered)
       let afterOffset = maybe id drop mOffset sorted
       let afterLimit  = maybe id take mLimit afterOffset
-      let projected = map (\(_, row) -> projectRow colIdxs row) afterLimit
+      let projected = map (\(_, row) -> projectRow schema colIdxs row) afterLimit
       let textRows = map (map formatValue) projected
       let deduped = if dist then ordNub textRows else textRows
       return (RowResult colInfos deduped)
@@ -314,28 +382,39 @@ literalToValue TBool (LitBool b)   = Right (VBool b)
 literalToValue ty lit              = Left ("Cannot convert " <> T.pack (show lit)
                                            <> " to " <> T.pack (show ty))
 
-resolveSelectTargets :: Schema -> [SelectTarget] -> Either Text ([ColumnInfo], [Int])
+data Projection = ProjIndex !Int | ProjExpr Expr
+
+resolveSelectTargets :: Schema -> [SelectTarget] -> Either Text ([ColumnInfo], [Projection])
 resolveSelectTargets schema [Star] =
   let infos = [ColumnInfo (columnName c) (columnType c) | c <- V.toList schema]
-      idxs  = [0 .. V.length schema - 1]
-  in Right (infos, idxs)
-resolveSelectTargets schema targets =
+      projs = [ProjIndex i | i <- [0 .. V.length schema - 1]]
+  in Right (infos, projs)
+resolveSelectTargets schema targets = do
   let indexed = Map.fromList [(columnName (schema V.! i), i) | i <- [0..V.length schema - 1]]
-      resolve (SQL.Column col) =
-        case Map.lookup col indexed of
+  pairs <- mapM (resolve indexed) targets
+  return (map fst pairs, map snd pairs)
+  where
+    resolve _ Star = Left "* cannot be mixed with column names"
+    resolve indexed (SelExpr (ExprColumn col) mAlias) =
+      case Map.lookup col indexed of
+        Just i  -> let c = schema V.! i
+                       name = maybe (columnName c) id mAlias
+                   in Right (ColumnInfo name (columnType c), ProjIndex i)
+        Nothing -> Left ("Column '" <> col <> "' does not exist in table")
+    resolve indexed (SelExpr (ExprQualColumn qual col) mAlias) =
+      let qualName = qual <> "." <> col
+      in case Map.lookup qualName indexed of
+        Just i  -> let c = schema V.! i
+                       name = maybe col id mAlias
+                   in Right (ColumnInfo name (columnType c), ProjIndex i)
+        Nothing -> case Map.lookup col indexed of
           Just i  -> let c = schema V.! i
-                     in Right (ColumnInfo (columnName c) (columnType c), i)
-          Nothing -> Left ("Column '" <> col <> "' does not exist in table")
-      resolve (ColumnAs col alias) =
-        case Map.lookup col indexed of
-          Just i  -> let c = schema V.! i
-                     in Right (ColumnInfo alias (columnType c), i)
-          Nothing -> Left ("Column '" <> col <> "' does not exist in table")
-      resolve Star = Left "* cannot be mixed with column names"
-      resolve (Agg _ _) = Left "Aggregate functions handled separately"
-  in do
-      pairs <- mapM resolve targets
-      return (map fst pairs, map snd pairs)
+                         name = maybe col id mAlias
+                     in Right (ColumnInfo name (columnType c), ProjIndex i)
+          Nothing -> Left ("Column '" <> qualName <> "' does not exist in table")
+    resolve _ (SelExpr expr mAlias) =
+      let name = maybe (descExpr expr) id mAlias
+      in Right (ColumnInfo name TText, ProjExpr expr)
 
 -- | O(n log n) deduplication preserving order.
 ordNub :: Ord a => [a] -> [a]
@@ -346,8 +425,11 @@ ordNub = go Set.empty
       | Set.member x seen = go seen xs
       | otherwise         = x : go (Set.insert x seen) xs
 
-projectRow :: [Int] -> Row -> [Value]
-projectRow idxs row = map (\i -> row V.! i) idxs
+projectRow :: Schema -> [Projection] -> Row -> [Value]
+projectRow schema projs row = map proj projs
+  where
+    proj (ProjIndex i) = row V.! i
+    proj (ProjExpr e)  = evalExpr schema row e
 
 formatValue :: Value -> Maybe Text
 formatValue (VInt32 n)   = Just (T.pack (show n))
@@ -384,14 +466,32 @@ evalExpr schema row (ExprIsNull e) =
   VBool (evalExpr schema row e == VNull)
 evalExpr schema row (ExprIsNotNull e) =
   VBool (evalExpr schema row e /= VNull)
-evalExpr schema row (ExprIn e es) =
+evalExpr schema row (ExprIn e (InList es)) =
   let v = evalExpr schema row e
       vs = map (evalExpr schema row) es
   in VBool (any (valEq v) vs)
+evalExpr _ _ (ExprIn _ (InSubquery _)) =
+  -- Subqueries should be pre-evaluated before reaching here
+  VNull
 evalExpr schema row (ExprNot e) =
   case evalExpr schema row e of
     VBool b -> VBool (not b)
     _       -> VNull
+evalExpr schema row (ExprQualColumn qual col) =
+  -- Try qualified name first (e.g. "t1.id"), then fallback to unqualified
+  let indexed = Map.fromList [(columnName (schema V.! i), i) | i <- [0..V.length schema - 1]]
+      qualName = qual <> "." <> col
+  in case Map.lookup qualName indexed of
+    Just i  -> row V.! i
+    Nothing -> case Map.lookup col indexed of
+      Just i  -> row V.! i
+      Nothing -> VNull
+evalExpr _ _ (ExprAgg _) = VNull  -- aggregates handled separately
+evalExpr schema row (ExprBetween e lo hi) =
+  let v  = evalExpr schema row e
+      vl = evalExpr schema row lo
+      vh = evalExpr schema row hi
+  in VBool (valCmp v vl `elem` [Just GT, Just EQ] && valCmp v vh `elem` [Just LT, Just EQ])
 evalExpr schema row (ExprBinOp op left right) =
   let lv = evalExpr schema row left
       rv = evalExpr schema row right
@@ -417,6 +517,11 @@ evalBinOp OpLte a b = VBool (valCmp a b `elem` [Just LT, Just EQ])
 evalBinOp OpGte a b = VBool (valCmp a b `elem` [Just GT, Just EQ])
 evalBinOp OpLike  (VText t) (VText pat) = VBool (sqlLike True t pat)
 evalBinOp OpILike (VText t) (VText pat) = VBool (sqlLike False t pat)
+evalBinOp OpAdd a b = valAdd a b
+evalBinOp OpSub a b = valSub a b
+evalBinOp OpMul a b = valMul a b
+evalBinOp OpDiv a b = valDiv a b
+evalBinOp OpMod a b = valMod a b
 evalBinOp _ _ _     = VNull
 
 -- | SQL LIKE/ILIKE pattern matching. caseSensitive=True for LIKE, False for ILIKE.
@@ -440,6 +545,67 @@ sqlLike cs = go
       _ -> go t p || case T.uncons t of
         Nothing     -> False
         Just (_, tRest) -> matchPercent tRest p
+
+-- Arithmetic helpers with numeric promotion
+valAdd :: Value -> Value -> Value
+valAdd (VInt32 a) (VInt32 b) = VInt32 (a + b)
+valAdd (VInt64 a) (VInt64 b) = VInt64 (a + b)
+valAdd (VFloat64 a) (VFloat64 b) = VFloat64 (a + b)
+valAdd (VInt32 a) (VInt64 b) = VInt64 (fromIntegral a + b)
+valAdd (VInt64 a) (VInt32 b) = VInt64 (a + fromIntegral b)
+valAdd (VInt32 a) (VFloat64 b) = VFloat64 (fromIntegral a + b)
+valAdd (VFloat64 a) (VInt32 b) = VFloat64 (a + fromIntegral b)
+valAdd (VInt64 a) (VFloat64 b) = VFloat64 (fromIntegral a + b)
+valAdd (VFloat64 a) (VInt64 b) = VFloat64 (a + fromIntegral b)
+valAdd _ _ = VNull
+
+valSub :: Value -> Value -> Value
+valSub (VInt32 a) (VInt32 b) = VInt32 (a - b)
+valSub (VInt64 a) (VInt64 b) = VInt64 (a - b)
+valSub (VFloat64 a) (VFloat64 b) = VFloat64 (a - b)
+valSub (VInt32 a) (VInt64 b) = VInt64 (fromIntegral a - b)
+valSub (VInt64 a) (VInt32 b) = VInt64 (a - fromIntegral b)
+valSub (VInt32 a) (VFloat64 b) = VFloat64 (fromIntegral a - b)
+valSub (VFloat64 a) (VInt32 b) = VFloat64 (a - fromIntegral b)
+valSub (VInt64 a) (VFloat64 b) = VFloat64 (fromIntegral a - b)
+valSub (VFloat64 a) (VInt64 b) = VFloat64 (a - fromIntegral b)
+valSub _ _ = VNull
+
+valMul :: Value -> Value -> Value
+valMul (VInt32 a) (VInt32 b) = VInt32 (a * b)
+valMul (VInt64 a) (VInt64 b) = VInt64 (a * b)
+valMul (VFloat64 a) (VFloat64 b) = VFloat64 (a * b)
+valMul (VInt32 a) (VInt64 b) = VInt64 (fromIntegral a * b)
+valMul (VInt64 a) (VInt32 b) = VInt64 (a * fromIntegral b)
+valMul (VInt32 a) (VFloat64 b) = VFloat64 (fromIntegral a * b)
+valMul (VFloat64 a) (VInt32 b) = VFloat64 (a * fromIntegral b)
+valMul (VInt64 a) (VFloat64 b) = VFloat64 (fromIntegral a * b)
+valMul (VFloat64 a) (VInt64 b) = VFloat64 (a * fromIntegral b)
+valMul _ _ = VNull
+
+valDiv :: Value -> Value -> Value
+valDiv _ (VInt32 0) = VNull
+valDiv _ (VInt64 0) = VNull
+valDiv _ (VFloat64 0.0) = VNull
+valDiv (VInt32 a) (VInt32 b) = VInt32 (a `div` b)
+valDiv (VInt64 a) (VInt64 b) = VInt64 (a `div` b)
+valDiv (VFloat64 a) (VFloat64 b) = VFloat64 (a / b)
+valDiv (VInt32 a) (VInt64 b) = VInt64 (fromIntegral a `div` b)
+valDiv (VInt64 a) (VInt32 b) = VInt64 (a `div` fromIntegral b)
+valDiv (VInt32 a) (VFloat64 b) = VFloat64 (fromIntegral a / b)
+valDiv (VFloat64 a) (VInt32 b) = VFloat64 (a / fromIntegral b)
+valDiv (VInt64 a) (VFloat64 b) = VFloat64 (fromIntegral a / b)
+valDiv (VFloat64 a) (VInt64 b) = VFloat64 (a / fromIntegral b)
+valDiv _ _ = VNull
+
+valMod :: Value -> Value -> Value
+valMod _ (VInt32 0) = VNull
+valMod _ (VInt64 0) = VNull
+valMod (VInt32 a) (VInt32 b) = VInt32 (a `mod` b)
+valMod (VInt64 a) (VInt64 b) = VInt64 (a `mod` b)
+valMod (VInt32 a) (VInt64 b) = VInt64 (fromIntegral a `mod` b)
+valMod (VInt64 a) (VInt32 b) = VInt64 (a `mod` fromIntegral b)
+valMod _ _ = VNull
 
 valEq :: Value -> Value -> Bool
 valEq VNull _ = False
@@ -545,8 +711,9 @@ execExplain stmt = do
   return (RowResult colInfo rows)
 
 describeStatement :: Statement -> [Text]
-describeStatement (Select dist targets name wh orderBy mLimit mOffset) =
-  let scan = "Seq Scan on " <> name
+describeStatement (Select dist targets from' wh groupBy _having orderBy mLimit mOffset) =
+  let name = fromTableName from'
+      scan = "Seq Scan on " <> name
       distLine = if dist then ["DISTINCT"] else []
       targetLine = case targets of
         [Star] -> []
@@ -554,6 +721,9 @@ describeStatement (Select dist targets name wh orderBy mLimit mOffset) =
       filterLine = case wh of
         Nothing -> []
         Just expr -> ["Filter: " <> descExpr expr]
+      groupByLine = case groupBy of
+        [] -> []
+        _  -> ["Group By: " <> T.intercalate ", " (map descExpr groupBy)]
       orderLine = case orderBy of
         [] -> []
         _  -> ["Sort: " <> T.intercalate ", " (map descOrder orderBy)]
@@ -563,7 +733,7 @@ describeStatement (Select dist targets name wh orderBy mLimit mOffset) =
       offsetLine = case mOffset of
         Nothing -> []
         Just n  -> ["Offset: " <> T.pack (show n)]
-  in [scan] <> distLine <> targetLine <> filterLine <> orderLine <> limitLine <> offsetLine
+  in [scan] <> distLine <> targetLine <> filterLine <> groupByLine <> orderLine <> limitLine <> offsetLine
 describeStatement (Insert name _ _) = ["Insert on " <> name]
 describeStatement (Update name _ _) = ["Update on " <> name]
 describeStatement (Delete name _)   = ["Delete on " <> name]
@@ -577,9 +747,9 @@ describeStatement Rollback = ["ROLLBACK"]
 
 descTarget :: SelectTarget -> Text
 descTarget Star = "*"
-descTarget (SQL.Column c) = c
-descTarget (ColumnAs c a) = c <> " AS " <> a
-descTarget (Agg f _) = descAggFunc f
+descTarget (SelExpr expr mAlias) = case mAlias of
+  Nothing -> descExpr expr
+  Just a  -> descExpr expr <> " AS " <> a
 
 descAggFunc :: AggFunc -> Text
 descAggFunc AggCount = "COUNT(*)"
@@ -599,8 +769,12 @@ descExpr (ExprColumn c) = c
 descExpr (ExprBinOp op l r) = descExpr l <> " " <> descOp op <> " " <> descExpr r
 descExpr (ExprIsNull e) = descExpr e <> " IS NULL"
 descExpr (ExprIsNotNull e) = descExpr e <> " IS NOT NULL"
-descExpr (ExprIn e es) = descExpr e <> " IN (" <> T.intercalate ", " (map descExpr es) <> ")"
+descExpr (ExprIn e (InList es)) = descExpr e <> " IN (" <> T.intercalate ", " (map descExpr es) <> ")"
+descExpr (ExprIn e (InSubquery sub)) = descExpr e <> " IN (" <> descSubquery sub <> ")"
 descExpr (ExprNot e) = "NOT " <> descExpr e
+descExpr (ExprBetween e lo hi) = descExpr e <> " BETWEEN " <> descExpr lo <> " AND " <> descExpr hi
+descExpr (ExprAgg f) = descAggFunc f
+descExpr (ExprQualColumn q c) = q <> "." <> c
 
 descOp :: BinOp -> Text
 descOp OpEq = "="
@@ -613,16 +787,234 @@ descOp OpAnd = "AND"
 descOp OpOr = "OR"
 descOp OpLike = "LIKE"
 descOp OpILike = "ILIKE"
+descOp OpAdd = "+"
+descOp OpSub = "-"
+descOp OpMul = "*"
+descOp OpDiv = "/"
+descOp OpMod = "%"
+
+descSubquery :: Statement -> Text
+descSubquery s = T.intercalate " " (describeStatement s)
 
 descOrder :: OrderByClause -> Text
 descOrder (OrderByClause c Asc) = c <> " ASC"
 descOrder (OrderByClause c Desc) = c <> " DESC"
 
+-- Subquery pre-evaluation
+
+textToLit :: ColumnType -> Text -> Literal
+textToLit TInt32 t = case TR.signed TR.decimal t of
+  Right (n, r) | T.null r -> LitInt n
+  _ -> LitText t
+textToLit TInt64 t = case TR.signed TR.decimal t of
+  Right (n, r) | T.null r -> LitInt n
+  _ -> LitText t
+textToLit TFloat64 t = case TR.double t of
+  Right (d, r) | T.null r -> LitFloat d
+  _ -> LitText t
+textToLit TBool "t" = LitBool True
+textToLit TBool "f" = LitBool False
+textToLit _ t = LitText t
+
+preEvalSubqueries :: Database -> Maybe TxState -> Expr -> ExceptT Text IO Expr
+preEvalSubqueries db mtx (ExprIn e (InSubquery subStmt)) = do
+  e' <- preEvalSubqueries db mtx e
+  result <- executeSQL db mtx subStmt
+  case result of
+    RowResult cols rows
+      | length cols /= 1 -> throwE "Subquery must return exactly one column"
+      | otherwise ->
+        let colType = ciType (head cols)
+            vals = [case r of
+                      [Just t] -> ExprLit (textToLit colType t)
+                      [Nothing] -> ExprLit LitNull
+                      _ -> ExprLit LitNull
+                   | r <- rows]
+        in return (ExprIn e' (InList vals))
+    _ -> throwE "Subquery must be a SELECT statement"
+preEvalSubqueries db mtx (ExprBinOp op l r) = do
+  l' <- preEvalSubqueries db mtx l
+  r' <- preEvalSubqueries db mtx r
+  return (ExprBinOp op l' r')
+preEvalSubqueries db mtx (ExprNot e) = do
+  e' <- preEvalSubqueries db mtx e
+  return (ExprNot e')
+preEvalSubqueries db mtx (ExprIn e (InList es)) = do
+  e' <- preEvalSubqueries db mtx e
+  es' <- mapM (preEvalSubqueries db mtx) es
+  return (ExprIn e' (InList es'))
+preEvalSubqueries db mtx (ExprBetween e lo hi) = do
+  e' <- preEvalSubqueries db mtx e
+  lo' <- preEvalSubqueries db mtx lo
+  hi' <- preEvalSubqueries db mtx hi
+  return (ExprBetween e' lo' hi')
+preEvalSubqueries _ _ e = return e
+
+-- GROUP BY helpers
+
+groupRows :: Schema -> [Expr] -> [(RowId, Row)] -> [([Value], [(RowId, Row)])]
+groupRows schema groupExprs rows =
+  let addToGroup acc r@(_, row) =
+        let key = map (evalExpr schema row) groupExprs
+        in case findGroup key acc of
+          Just (existing, rest) -> (key, r : existing) : rest
+          Nothing -> (key, [r]) : acc
+      findGroup _ [] = Nothing
+      findGroup key ((k, v) : rest)
+        | keyEq key k = Just (v, rest)
+        | otherwise = case findGroup key rest of
+            Just (v', rest') -> Just (v', (k, v) : rest')
+            Nothing -> Nothing
+      keyEq [] [] = True
+      keyEq (a:as) (b:bs) = valEq a b && keyEq as bs
+      keyEq _ _ = False
+  in foldl addToGroup [] rows
+
+computeGroupBy :: Schema -> [SelectTarget] -> [Expr] -> [([Value], [(RowId, Row)])]
+               -> Either Text ([ColumnInfo], [([Value], Map.Map Text Value)])
+computeGroupBy schema targets groupExprs groups = do
+  -- For each group, compute each select target
+  let groupList = groups
+  colInfos <- mapM (targetInfo schema) targets
+  resultRows <- mapM (\(key, groupRows') ->
+    let vals = map (computeGroupTarget schema targets groupExprs key groupRows') targets
+    in do
+      vs <- sequence vals
+      -- Also build a map of aggregate values for HAVING
+      let aggMap = Map.fromList [(descExpr e, computeAggValue schema e groupRows')
+                                | SelExpr e _ <- targets, containsAgg e]
+      return (vs, aggMap)
+    ) groupList
+  return (colInfos, resultRows)
+
+targetInfo :: Schema -> SelectTarget -> Either Text ColumnInfo
+targetInfo _ Star = Left "* not supported with GROUP BY"
+targetInfo schema (SelExpr (ExprColumn col) mAlias) =
+  case findColIdx schema col of
+    Right idx -> let c = schema V.! idx
+                 in Right (ColumnInfo (maybe (columnName c) id mAlias) (columnType c))
+    Left _ -> Right (ColumnInfo (maybe col id mAlias) TText)
+targetInfo schema (SelExpr (ExprAgg f) mAlias) =
+  let name = maybe (descAggFunc f) id mAlias
+  in case f of
+    AggCount -> Right (ColumnInfo name TInt64)
+    AggCountCol _ -> Right (ColumnInfo name TInt64)
+    AggSum col -> case findColIdx schema col of
+      Right idx -> let ct = columnType (schema V.! idx)
+                       rt = case ct of { TInt32 -> TInt64; TInt64 -> TInt64; _ -> TFloat64 }
+                   in Right (ColumnInfo name rt)
+      Left _ -> Right (ColumnInfo name TInt64)
+    AggAvg _ -> Right (ColumnInfo name TFloat64)
+    AggMin col -> case findColIdx schema col of
+      Right idx -> Right (ColumnInfo name (columnType (schema V.! idx)))
+      Left _ -> Right (ColumnInfo name TText)
+    AggMax col -> case findColIdx schema col of
+      Right idx -> Right (ColumnInfo name (columnType (schema V.! idx)))
+      Left _ -> Right (ColumnInfo name TText)
+targetInfo _ (SelExpr expr mAlias) =
+  Right (ColumnInfo (maybe (descExpr expr) id mAlias) TText)
+
+computeGroupTarget :: Schema -> [SelectTarget] -> [Expr] -> [Value] -> [(RowId, Row)]
+                   -> SelectTarget -> Either Text Value
+computeGroupTarget _ _ _ _ _ Star = Left "* not supported with GROUP BY"
+computeGroupTarget schema _ groupExprs key _ (SelExpr (ExprColumn col) _) =
+  -- Column must be in GROUP BY
+  case findGroupKeyIndex schema groupExprs col of
+    Just idx -> Right (key !! idx)
+    Nothing -> Left ("Column '" <> col <> "' must appear in GROUP BY or be in an aggregate")
+computeGroupTarget schema _ _ _ groupRows' (SelExpr (ExprAgg f) _) =
+  Right (computeAggValue schema (ExprAgg f) groupRows')
+computeGroupTarget schema _ groupExprs key groupRows' (SelExpr expr _) =
+  -- For complex expressions, try evaluating with a representative row
+  if containsAgg expr
+    then Right (computeAggValue schema expr groupRows')
+    else case groupRows' of
+      ((_, row):_) -> Right (evalExpr schema row expr)
+      [] -> Right VNull
+
+computeAggValue :: Schema -> Expr -> [(RowId, Row)] -> Value
+computeAggValue _ (ExprAgg AggCount) rows = VInt64 (fromIntegral (length rows))
+computeAggValue schema (ExprAgg (AggCountCol col)) rows =
+  case findColIdx schema col of
+    Right idx -> VInt64 (fromIntegral (length [() | (_, row) <- rows, row V.! idx /= VNull]))
+    Left _ -> VNull
+computeAggValue schema (ExprAgg (AggSum col)) rows =
+  case findColIdx schema col of
+    Right idx ->
+      let vals = [row V.! idx | (_, row) <- rows, row V.! idx /= VNull]
+      in case sumValues vals of
+        Just v -> v
+        Nothing -> VNull
+    Left _ -> VNull
+computeAggValue schema (ExprAgg (AggAvg col)) rows =
+  case findColIdx schema col of
+    Right idx ->
+      let vals = [row V.! idx | (_, row) <- rows, row V.! idx /= VNull]
+      in case (sumValues vals, length vals) of
+        (Just sv, n) | n > 0 -> VFloat64 (valueToDouble sv / fromIntegral n)
+        _ -> VNull
+    Left _ -> VNull
+computeAggValue schema (ExprAgg (AggMin col)) rows =
+  case findColIdx schema col of
+    Right idx ->
+      let vals = [row V.! idx | (_, row) <- rows, row V.! idx /= VNull]
+      in case vals of
+        [] -> VNull
+        _  -> foldl1 (\a b -> if valCmp a b == Just LT then a else b) vals
+    Left _ -> VNull
+computeAggValue schema (ExprAgg (AggMax col)) rows =
+  case findColIdx schema col of
+    Right idx ->
+      let vals = [row V.! idx | (_, row) <- rows, row V.! idx /= VNull]
+      in case vals of
+        [] -> VNull
+        _  -> foldl1 (\a b -> if valCmp a b == Just GT then a else b) vals
+    Left _ -> VNull
+computeAggValue _ _ _ = VNull
+
+findGroupKeyIndex :: Schema -> [Expr] -> Text -> Maybe Int
+findGroupKeyIndex schema groupExprs col =
+  let matches = zip [0..] groupExprs
+  in case [i | (i, ExprColumn c) <- matches, c == col] of
+    (i:_) -> Just i
+    [] -> Nothing
+
+evalHaving :: Expr -> Map.Map Text Value -> Bool
+evalHaving (ExprBinOp OpGt (ExprAgg f) (ExprLit lit)) vals =
+  case Map.lookup (descAggFunc f) vals of
+    Just v -> valCmp v (litToValue lit) == Just GT
+    Nothing -> False
+evalHaving (ExprBinOp OpGte (ExprAgg f) (ExprLit lit)) vals =
+  case Map.lookup (descAggFunc f) vals of
+    Just v -> valCmp v (litToValue lit) `elem` [Just GT, Just EQ]
+    Nothing -> False
+evalHaving (ExprBinOp OpLt (ExprAgg f) (ExprLit lit)) vals =
+  case Map.lookup (descAggFunc f) vals of
+    Just v -> valCmp v (litToValue lit) == Just LT
+    Nothing -> False
+evalHaving (ExprBinOp OpEq (ExprAgg f) (ExprLit lit)) vals =
+  case Map.lookup (descAggFunc f) vals of
+    Just v -> valEq v (litToValue lit)
+    Nothing -> False
+evalHaving _ _ = False
+
 -- Aggregate helpers
 
 isAggTarget :: SelectTarget -> Bool
-isAggTarget (Agg _ _) = True
-isAggTarget _         = False
+isAggTarget (SelExpr expr _) = containsAgg expr
+isAggTarget Star = False
+
+containsAgg :: Expr -> Bool
+containsAgg (ExprAgg _) = True
+containsAgg (ExprBinOp _ l r) = containsAgg l || containsAgg r
+containsAgg (ExprNot e) = containsAgg e
+containsAgg (ExprIsNull e) = containsAgg e
+containsAgg (ExprIsNotNull e) = containsAgg e
+containsAgg (ExprIn e (InList es)) = containsAgg e || any containsAgg es
+containsAgg (ExprIn e (InSubquery _)) = containsAgg e
+containsAgg (ExprBetween e lo hi) = containsAgg e || containsAgg lo || containsAgg hi
+containsAgg (ExprQualColumn _ _) = False
+containsAgg _ = False
 
 computeAggregates :: Schema -> [SelectTarget] -> [(RowId, Row)]
                   -> Either Text ([ColumnInfo], [Maybe Text])
@@ -636,15 +1028,21 @@ computeAggregates schema targets rows = do
 
 computeOneAgg :: Schema -> [(RowId, Row)] -> SelectTarget
               -> Either Text (ColumnInfo, Maybe Text)
-computeOneAgg _ rows (Agg AggCount mAlias) =
+computeOneAgg schema rows (SelExpr expr mAlias) =
+  computeAggExpr schema rows expr mAlias
+computeOneAgg _ _ Star = Left "* in aggregate query"
+
+computeAggExpr :: Schema -> [(RowId, Row)] -> Expr -> Maybe Text
+               -> Either Text (ColumnInfo, Maybe Text)
+computeAggExpr _ rows (ExprAgg AggCount) mAlias =
   let name = fromMaybe "count" mAlias
   in Right (ColumnInfo name TInt64, Just (T.pack (show (length rows))))
-computeOneAgg schema rows (Agg (AggCountCol col) mAlias) = do
+computeAggExpr schema rows (ExprAgg (AggCountCol col)) mAlias = do
   idx <- findColIdx schema col
   let count = length [() | (_, row) <- rows, row V.! idx /= VNull]
       name = fromMaybe "count" mAlias
   Right (ColumnInfo name TInt64, Just (T.pack (show count)))
-computeOneAgg schema rows (Agg (AggSum col) mAlias) = do
+computeAggExpr schema rows (ExprAgg (AggSum col)) mAlias = do
   idx <- findColIdx schema col
   let colType = columnType (schema V.! idx)
       vals = [row V.! idx | (_, row) <- rows, row V.! idx /= VNull]
@@ -655,7 +1053,7 @@ computeOneAgg schema rows (Agg (AggSum col) mAlias) = do
         TInt64  -> TInt64
         _       -> TFloat64
   Right (ColumnInfo name resultType, total >>= formatValue)
-computeOneAgg schema rows (Agg (AggAvg col) mAlias) = do
+computeAggExpr schema rows (ExprAgg (AggAvg col)) mAlias = do
   idx <- findColIdx schema col
   let vals = [row V.! idx | (_, row) <- rows, row V.! idx /= VNull]
       name = fromMaybe "avg" mAlias
@@ -664,7 +1062,7 @@ computeOneAgg schema rows (Agg (AggAvg col) mAlias) = do
       let s = valueToDouble sv
       in Right (ColumnInfo name TFloat64, Just (T.pack (show (s / fromIntegral n :: Double))))
     _ -> Right (ColumnInfo name TFloat64, Nothing)
-computeOneAgg schema rows (Agg (AggMin col) mAlias) = do
+computeAggExpr schema rows (ExprAgg (AggMin col)) mAlias = do
   idx <- findColIdx schema col
   let colType = columnType (schema V.! idx)
       vals = [row V.! idx | (_, row) <- rows, row V.! idx /= VNull]
@@ -673,7 +1071,7 @@ computeOneAgg schema rows (Agg (AggMin col) mAlias) = do
     [] -> Right (ColumnInfo name colType, Nothing)
     _  -> let minVal = foldl1 (\a b -> if valCmp a b == Just LT then a else b) vals
           in Right (ColumnInfo name colType, formatValue minVal)
-computeOneAgg schema rows (Agg (AggMax col) mAlias) = do
+computeAggExpr schema rows (ExprAgg (AggMax col)) mAlias = do
   idx <- findColIdx schema col
   let colType = columnType (schema V.! idx)
       vals = [row V.! idx | (_, row) <- rows, row V.! idx /= VNull]
@@ -682,7 +1080,7 @@ computeOneAgg schema rows (Agg (AggMax col) mAlias) = do
     [] -> Right (ColumnInfo name colType, Nothing)
     _  -> let maxVal = foldl1 (\a b -> if valCmp a b == Just GT then a else b) vals
           in Right (ColumnInfo name colType, formatValue maxVal)
-computeOneAgg _ _ _ = Left "Non-aggregate target in aggregate query"
+computeAggExpr _ _ _ _ = Left "Non-aggregate target in aggregate query"
 
 findColIdx :: Schema -> Text -> Either Text Int
 findColIdx schema col =

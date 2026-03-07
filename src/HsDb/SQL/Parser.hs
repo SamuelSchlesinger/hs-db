@@ -145,6 +145,9 @@ reservedWords = Set.fromList
   , "begin", "commit", "rollback"
   , "distinct", "as", "count", "sum", "avg", "min", "max"
   , "like", "ilike", "in", "alter", "add", "column", "explain"
+  , "between"
+  , "join", "inner", "left", "right", "cross", "outer", "on", "full"
+  , "group", "having"
   ]
 
 -- Statements
@@ -349,13 +352,27 @@ pSelect s0 = do
   (isDistinct, s2) <- pTryKeyword "DISTINCT" s1
   (targets, s3) <- pSelectTargets s2
   ((), s4) <- pKeyword "FROM" s3
-  (name, s5) <- pIdentifier s4
+  (fromClause, s5) <- pFromClause s4
   (wh, s6) <- pOptional pWhere s5
-  (mOrderBy, s7) <- pOptional pOrderBy s6
-  (mLimit, s8) <- pOptional pLimit s7
-  (mOffset, s9) <- pOptional pOffset s8
+  (mGroupBy, s7) <- pOptional pGroupBy s6
+  (mHaving, s8) <- pOptional pHaving s7
+  (mOrderBy, s9) <- pOptional pOrderBy s8
+  (mLimit, s10) <- pOptional pLimit s9
+  (mOffset, s11) <- pOptional pOffset s10
   let orderClauses = maybe [] id mOrderBy
-  Right (Select isDistinct targets name wh orderClauses mLimit mOffset, s9)
+      groupByExprs = maybe [] id mGroupBy
+  Right (Select isDistinct targets fromClause wh groupByExprs mHaving orderClauses mLimit mOffset, s11)
+
+pGroupBy :: Parser [Expr]
+pGroupBy s0 = do
+  ((), s1) <- pKeyword "GROUP" s0
+  ((), s2) <- pKeyword "BY" s1
+  pCommaSep pExpr s2
+
+pHaving :: Parser Expr
+pHaving s0 = do
+  ((), s1) <- pKeyword "HAVING" s0
+  pExpr s1
 
 pOrderBy :: Parser [OrderByClause]
 pOrderBy s0 = do
@@ -398,23 +415,80 @@ pSelectTargets s0 = do
 
 pSelectColumn :: Parser SelectTarget
 pSelectColumn s0 = do
-  let s = skipWhitespace s0
-  -- Try aggregate functions first
-  case pTryAgg s of
-    Right (Just agg, s1) -> do
-      (mAlias, s2) <- pOptional pAlias s1
-      Right (Agg agg mAlias, s2)
-    _ -> do
-      (name, s1) <- pIdentifier s0
-      (mAlias, s2) <- pOptional pAlias s1
-      case mAlias of
-        Nothing    -> Right (Column name, s2)
-        Just alias -> Right (ColumnAs name alias, s2)
+  (expr, s1) <- pExpr s0
+  (mAlias, s2) <- pOptional pAlias s1
+  Right (SelExpr expr mAlias, s2)
 
 pAlias :: Parser Text
 pAlias s0 = do
   ((), s1) <- pKeyword "AS" s0
   pIdentifier s1
+
+pFromClause :: Parser FromClause
+pFromClause s0 = do
+  (left, s1) <- pFromSingle s0
+  pJoinRest left s1
+
+pFromSingle :: Parser FromClause
+pFromSingle s0 = do
+  (name, s1) <- pIdentifier s0
+  -- Try AS alias
+  case pKeyword "AS" s1 of
+    Right ((), s2) -> do
+      (alias, s3) <- pIdentifier s2
+      Right (FromTable name (Just alias), s3)
+    Left _ ->
+      -- Try bare alias (non-keyword identifier)
+      case pIdentifier s1 of
+        Right (alias, s2) -> Right (FromTable name (Just alias), s2)
+        Left _ -> Right (FromTable name Nothing, s1)
+
+pJoinRest :: FromClause -> Parser FromClause
+pJoinRest left s0 = do
+  let s = skipWhitespace s0
+  -- Try CROSS JOIN
+  case pTryKeyword "CROSS" s of
+    Right (True, s1) -> do
+      ((), s2) <- pKeyword "JOIN" s1
+      (right, s3) <- pFromSingle s2
+      pJoinRest (FromJoin CrossJoin left right Nothing) s3
+    _ ->
+      -- Try LEFT [OUTER] JOIN
+      case pTryKeyword "LEFT" s of
+        Right (True, s1) -> do
+          (_, s2) <- pTryKeyword "OUTER" s1
+          ((), s3) <- pKeyword "JOIN" s2
+          (right, s4) <- pFromSingle s3
+          ((), s5) <- pKeyword "ON" s4
+          (cond, s6) <- pExpr s5
+          pJoinRest (FromJoin LeftJoin left right (Just cond)) s6
+        _ ->
+          -- Try RIGHT [OUTER] JOIN
+          case pTryKeyword "RIGHT" s of
+            Right (True, s1) -> do
+              (_, s2) <- pTryKeyword "OUTER" s1
+              ((), s3) <- pKeyword "JOIN" s2
+              (right, s4) <- pFromSingle s3
+              ((), s5) <- pKeyword "ON" s4
+              (cond, s6) <- pExpr s5
+              pJoinRest (FromJoin RightJoin left right (Just cond)) s6
+            _ ->
+              -- Try [INNER] JOIN
+              case pTryKeyword "INNER" s of
+                Right (True, s1) -> do
+                  ((), s2) <- pKeyword "JOIN" s1
+                  (right, s3) <- pFromSingle s2
+                  ((), s4) <- pKeyword "ON" s3
+                  (cond, s5) <- pExpr s4
+                  pJoinRest (FromJoin InnerJoin left right (Just cond)) s5
+                _ ->
+                  case pTryKeyword "JOIN" s of
+                    Right (True, s1) -> do
+                      (right, s2) <- pFromSingle s1
+                      ((), s3) <- pKeyword "ON" s2
+                      (cond, s4) <- pExpr s3
+                      pJoinRest (FromJoin InnerJoin left right (Just cond)) s4
+                    _ -> Right (left, s)
 
 -- Try to parse an aggregate function. Returns (Just agg, advanced state) on
 -- match, or (Nothing, original state) on no match.
@@ -524,7 +598,7 @@ pNot s0 = do
 
 pComparison :: Parser Expr
 pComparison s0 = do
-  (left, s1) <- pAtom s0
+  (left, s1) <- pAddSub s0
   let s1' = skipWhitespace s1
   -- Try IS NULL / IS NOT NULL
   case pTryKeyword "IS" s1' of
@@ -535,30 +609,99 @@ pComparison s0 = do
         then Right (ExprIsNotNull left, s4)
         else Right (ExprIsNull left, s4)
     _ -> do
-      -- Try LIKE / ILIKE
-      case pTryKeyword "LIKE" s1' of
+      -- Try BETWEEN lo AND hi
+      case pTryKeyword "BETWEEN" s1' of
         Right (True, s2) -> do
-          (right, s3) <- pAtom s2
-          Right (ExprBinOp OpLike left right, s3)
-        _ -> case pTryKeyword "ILIKE" s1' of
-          Right (True, s2) -> do
-            (right, s3) <- pAtom s2
-            Right (ExprBinOp OpILike left right, s3)
-          _ ->
-            -- Try IN (val1, val2, ...)
-            case pTryKeyword "IN" s1' of
+          (lo, s3) <- pAddSub s2
+          ((), s4) <- pKeyword "AND" s3
+          (hi, s5) <- pAddSub s4
+          Right (ExprBetween left lo hi, s5)
+        _ -> do
+          -- Try LIKE / ILIKE
+          case pTryKeyword "LIKE" s1' of
+            Right (True, s2) -> do
+              (right, s3) <- pAddSub s2
+              Right (ExprBinOp OpLike left right, s3)
+            _ -> case pTryKeyword "ILIKE" s1' of
               Right (True, s2) -> do
-                ((), s3) <- pSymbol '(' s2
-                (exprs, s4) <- pCommaSep pExpr s3
-                ((), s5) <- pSymbol ')' s4
-                Right (ExprIn left exprs, s5)
-              _ -> do
-                -- Try comparison operators
-                case pCompOp s1' of
-                  Right (op, s2) -> do
-                    (right, s3) <- pAtom s2
-                    Right (ExprBinOp op left right, s3)
-                  Left _ -> Right (left, s1')
+                (right, s3) <- pAddSub s2
+                Right (ExprBinOp OpILike left right, s3)
+              _ ->
+                -- Try IN (val1, val2, ...) or IN (SELECT ...)
+                case pTryKeyword "IN" s1' of
+                  Right (True, s2) -> do
+                    ((), s3) <- pSymbol '(' s2
+                    -- Peek for SELECT keyword
+                    let s3' = skipWhitespace s3
+                    case pTryKeyword "SELECT" s3' of
+                      Right (True, _) -> do
+                        -- Parse subquery
+                        (subStmt, s4) <- pStatement s3
+                        ((), s5) <- pSymbol ')' s4
+                        Right (ExprIn left (InSubquery subStmt), s5)
+                      _ -> do
+                        (exprs, s4) <- pCommaSep pExpr s3
+                        ((), s5) <- pSymbol ')' s4
+                        Right (ExprIn left (InList exprs), s5)
+                  _ -> do
+                    -- Try comparison operators
+                    case pCompOp s1' of
+                      Right (op, s2) -> do
+                        (right, s3) <- pAddSub s2
+                        Right (ExprBinOp op left right, s3)
+                      Left _ -> Right (left, s1')
+
+pAddSub :: Parser Expr
+pAddSub s0 = do
+  (left, s1) <- pMulDiv s0
+  pAddSubRest left s1
+  where
+    pAddSubRest left s =
+      let s' = skipWhitespace s
+      in case T.uncons (psInput s') of
+        Just ('+', rest) ->
+          let s2 = s' { psInput = rest, psPos = psPos s' + 1 }
+          in do (right, s3) <- pMulDiv s2
+                pAddSubRest (ExprBinOp OpAdd left right) s3
+        Just ('-', rest) ->
+          -- Only treat as subtraction if not followed by a digit (ambiguity with negative literals)
+          -- Actually, at this point the left side is already parsed, so '-' is subtraction
+          let s2 = s' { psInput = rest, psPos = psPos s' + 1 }
+          in do (right, s3) <- pMulDiv s2
+                pAddSubRest (ExprBinOp OpSub left right) s3
+        _ -> Right (left, s)
+
+pMulDiv :: Parser Expr
+pMulDiv s0 = do
+  (left, s1) <- pUnary s0
+  pMulDivRest left s1
+  where
+    pMulDivRest left s =
+      let s' = skipWhitespace s
+      in case T.uncons (psInput s') of
+        Just ('*', rest) ->
+          let s2 = s' { psInput = rest, psPos = psPos s' + 1 }
+          in do (right, s3) <- pUnary s2
+                pMulDivRest (ExprBinOp OpMul left right) s3
+        Just ('/', rest) ->
+          let s2 = s' { psInput = rest, psPos = psPos s' + 1 }
+          in do (right, s3) <- pUnary s2
+                pMulDivRest (ExprBinOp OpDiv left right) s3
+        Just ('%', rest) ->
+          let s2 = s' { psInput = rest, psPos = psPos s' + 1 }
+          in do (right, s3) <- pUnary s2
+                pMulDivRest (ExprBinOp OpMod left right) s3
+        _ -> Right (left, s)
+
+pUnary :: Parser Expr
+pUnary s0 = do
+  let s = skipWhitespace s0
+  case T.uncons (psInput s) of
+    Just ('-', rest) ->
+      let s1 = s { psInput = rest, psPos = psPos s + 1 }
+      in do (e, s2) <- pUnary s1
+            Right (ExprBinOp OpSub (ExprLit (LitInt 0)) e, s2)
+    _ -> pAtom s0
 
 pCompOp :: Parser BinOp
 pCompOp s0 = do
@@ -591,7 +734,7 @@ pAtom s0 = do
       (lit, s1) <- pStringLit s
       Right (ExprLit lit, s1)
     Just (c, _)
-      | isDigit c || c == '-' -> do
+      | isDigit c -> do
           (lit, s1) <- pNumLit s
           Right (ExprLit lit, s1)
     _ -> do
@@ -605,6 +748,16 @@ pAtom s0 = do
           (isNull, s3) <- pTryKeyword "NULL" s
           if isNull then Right (ExprLit LitNull, s3)
           else do
-            -- Must be a column reference
-            (name, s4) <- pIdentifier s
-            Right (ExprColumn name, s4)
+            -- Try aggregate functions
+            case pTryAgg s of
+              Right (Just agg, s4) -> Right (ExprAgg agg, s4)
+              _ -> do
+                -- Must be a column reference, possibly qualified
+                (name, s4) <- pIdentifier s
+                -- Check for dot (qualified reference)
+                case T.uncons (psInput s4) of
+                  Just ('.', rest) ->
+                    let s5 = s4 { psInput = rest, psPos = psPos s4 + 1 }
+                    in do (col, s6) <- pIdentifier s5
+                          Right (ExprQualColumn name col, s6)
+                  _ -> Right (ExprColumn name, s4)

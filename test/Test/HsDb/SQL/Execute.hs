@@ -54,6 +54,26 @@ executeTests = Group "SQL.Execute"
   , ("prop_not_operator", prop_not_operator)
   , ("prop_alter_add_column", prop_alter_add_column)
   , ("prop_explain", prop_explain)
+  , ("prop_arithmetic_where", prop_arithmetic_where)
+  , ("prop_arithmetic_update", prop_arithmetic_update)
+  , ("prop_arithmetic_precedence", prop_arithmetic_precedence)
+  , ("prop_between", prop_between)
+  , ("prop_not_between", prop_not_between)
+  , ("prop_division_by_zero", prop_division_by_zero)
+  , ("prop_mixed_type_arithmetic", prop_mixed_type_arithmetic)
+  , ("prop_table_alias", prop_table_alias)
+  , ("prop_qualified_column", prop_qualified_column)
+  , ("prop_inner_join", prop_inner_join)
+  , ("prop_left_join", prop_left_join)
+  , ("prop_right_join", prop_right_join)
+  , ("prop_cross_join", prop_cross_join)
+  , ("prop_join_with_where", prop_join_with_where)
+  , ("prop_group_by_count", prop_group_by_count)
+  , ("prop_group_by_sum", prop_group_by_sum)
+  , ("prop_group_by_having", prop_group_by_having)
+  , ("prop_in_subquery", prop_in_subquery)
+  , ("prop_not_in_subquery", prop_not_in_subquery)
+  , ("prop_in_subquery_empty", prop_in_subquery_empty)
   ]
 
 -- Run a SQL string against a fresh database in a temp directory.
@@ -516,4 +536,231 @@ prop_explain = withTests 1 $ property $ do
       map ciName cols === ["QUERY PLAN"]
       -- Should have multiple plan lines
       assert (length rows >= 2)
+    other -> do annotateShow other; failure
+
+prop_arithmetic_where :: Property
+prop_arithmetic_where = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL, y INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x, y) VALUES (3, 4), (1, 2), (5, 6)"
+    execSQL db "SELECT x FROM t WHERE x + y > 5 ORDER BY x"
+  case result of
+    RowResult _ rows -> rows === [[Just "3"], [Just "5"]]
+    other -> do annotateShow other; failure
+
+prop_arithmetic_update :: Property
+prop_arithmetic_update = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (10)"
+    _ <- execSQL db "UPDATE t SET x = x + 1"
+    execSQL db "SELECT x FROM t"
+  case result of
+    RowResult _ rows -> rows === [[Just "11"]]
+    other -> do annotateShow other; failure
+
+prop_arithmetic_precedence :: Property
+prop_arithmetic_precedence = withTests 1 $ property $ do
+  -- 2 + 3 * 4 = 14
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (14)"
+    execSQL db "SELECT x FROM t WHERE x = 2 + 3 * 4"
+  case result of
+    RowResult _ rows -> rows === [[Just "14"]]
+    other -> do annotateShow other; failure
+
+prop_between :: Property
+prop_between = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1), (2), (3), (4), (5)"
+    execSQL db "SELECT x FROM t WHERE x BETWEEN 2 AND 4 ORDER BY x"
+  case result of
+    RowResult _ rows -> rows === [[Just "2"], [Just "3"], [Just "4"]]
+    other -> do annotateShow other; failure
+
+prop_not_between :: Property
+prop_not_between = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (1), (2), (3), (4), (5)"
+    execSQL db "SELECT x FROM t WHERE NOT x BETWEEN 2 AND 4 ORDER BY x"
+  case result of
+    RowResult _ rows -> rows === [[Just "1"], [Just "5"]]
+    other -> do annotateShow other; failure
+
+prop_division_by_zero :: Property
+prop_division_by_zero = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x) VALUES (10)"
+    execSQL db "SELECT x FROM t WHERE x / 0 IS NULL"
+  case result of
+    RowResult _ rows -> rows === [[Just "10"]]
+    other -> do annotateShow other; failure
+
+prop_mixed_type_arithmetic :: Property
+prop_mixed_type_arithmetic = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (x INT NOT NULL, y FLOAT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (x, y) VALUES (1, 2.5)"
+    execSQL db "SELECT x FROM t WHERE x + y > 3.0"
+  case result of
+    RowResult _ rows -> rows === [[Just "1"]]
+    other -> do annotateShow other; failure
+
+prop_table_alias :: Property
+prop_table_alias = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE demo (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO demo (x) VALUES (42)"
+    execSQL db "SELECT * FROM demo d"
+  case result of
+    RowResult _ rows -> rows === [[Just "42"]]
+    other -> do annotateShow other; failure
+
+prop_qualified_column :: Property
+prop_qualified_column = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE demo (x INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO demo (x) VALUES (1), (2), (3)"
+    execSQL db "SELECT d.x FROM demo d WHERE d.x > 1 ORDER BY x"
+  case result of
+    RowResult _ rows -> rows === [[Just "2"], [Just "3"]]
+    other -> do annotateShow other; failure
+
+prop_inner_join :: Property
+prop_inner_join = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t1 (id INT NOT NULL, name TEXT)"
+    _ <- execSQL db "CREATE TABLE t2 (id INT NOT NULL, val INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t1 (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+    _ <- execSQL db "INSERT INTO t2 (id, val) VALUES (1, 10), (3, 30)"
+    execSQL db "SELECT t1.name, t2.val FROM t1 JOIN t2 ON t1.id = t2.id"
+  case result of
+    RowResult _ rows -> do
+      length rows === 2
+    other -> do annotateShow other; failure
+
+prop_left_join :: Property
+prop_left_join = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t1 (id INT NOT NULL, name TEXT)"
+    _ <- execSQL db "CREATE TABLE t2 (id INT NOT NULL, val INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t1 (id, name) VALUES (1, 'a'), (2, 'b')"
+    _ <- execSQL db "INSERT INTO t2 (id, val) VALUES (1, 10)"
+    execSQL db "SELECT * FROM t1 LEFT JOIN t2 ON t1.id = t2.id"
+  case result of
+    RowResult _ rows -> do
+      -- Row for id=1 should have t2 vals, row for id=2 should have NULLs
+      length rows === 2
+    other -> do annotateShow other; failure
+
+prop_right_join :: Property
+prop_right_join = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t1 (id INT NOT NULL, name TEXT)"
+    _ <- execSQL db "CREATE TABLE t2 (id INT NOT NULL, val INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t1 (id, name) VALUES (1, 'a')"
+    _ <- execSQL db "INSERT INTO t2 (id, val) VALUES (1, 10), (2, 20)"
+    execSQL db "SELECT * FROM t1 RIGHT JOIN t2 ON t1.id = t2.id"
+  case result of
+    RowResult _ rows -> do
+      length rows === 2
+    other -> do annotateShow other; failure
+
+prop_cross_join :: Property
+prop_cross_join = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t1 (x INT NOT NULL)"
+    _ <- execSQL db "CREATE TABLE t2 (y INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t1 (x) VALUES (1), (2)"
+    _ <- execSQL db "INSERT INTO t2 (y) VALUES (10), (20)"
+    execSQL db "SELECT * FROM t1 CROSS JOIN t2"
+  case result of
+    RowResult _ rows -> length rows === 4  -- 2 x 2
+    other -> do annotateShow other; failure
+
+prop_join_with_where :: Property
+prop_join_with_where = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t1 (id INT NOT NULL, name TEXT)"
+    _ <- execSQL db "CREATE TABLE t2 (id INT NOT NULL, val INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t1 (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+    _ <- execSQL db "INSERT INTO t2 (id, val) VALUES (1, 10), (2, 20), (3, 30)"
+    execSQL db "SELECT t1.name FROM t1 JOIN t2 ON t1.id = t2.id WHERE t2.val > 15"
+  case result of
+    RowResult _ rows -> length rows === 2
+    other -> do annotateShow other; failure
+
+prop_group_by_count :: Property
+prop_group_by_count = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (status TEXT NOT NULL, val INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (status, val) VALUES ('a', 1), ('b', 2), ('a', 3), ('b', 4), ('a', 5)"
+    execSQL db "SELECT status, COUNT(*) FROM t GROUP BY status"
+  case result of
+    RowResult cols rows -> do
+      map ciName cols === ["status", "COUNT(*)"]
+      length rows === 2
+    other -> do annotateShow other; failure
+
+prop_group_by_sum :: Property
+prop_group_by_sum = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (cat TEXT NOT NULL, amount INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (cat, amount) VALUES ('x', 10), ('y', 20), ('x', 30)"
+    execSQL db "SELECT cat, SUM(amount) FROM t GROUP BY cat"
+  case result of
+    RowResult cols rows -> do
+      map ciName cols === ["cat", "SUM(amount)"]
+      length rows === 2
+    other -> do annotateShow other; failure
+
+prop_group_by_having :: Property
+prop_group_by_having = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t (status TEXT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t (status) VALUES ('a'), ('b'), ('a'), ('c'), ('a')"
+    execSQL db "SELECT status, COUNT(*) FROM t GROUP BY status HAVING COUNT(*) > 1"
+  case result of
+    RowResult _ rows -> do
+      -- Only 'a' has count > 1 (count = 3)
+      length rows === 1
+    other -> do annotateShow other; failure
+
+prop_in_subquery :: Property
+prop_in_subquery = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t1 (id INT NOT NULL, name TEXT)"
+    _ <- execSQL db "CREATE TABLE t2 (id INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t1 (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+    _ <- execSQL db "INSERT INTO t2 (id) VALUES (1), (3)"
+    execSQL db "SELECT name FROM t1 WHERE id IN (SELECT id FROM t2) ORDER BY name"
+  case result of
+    RowResult _ rows -> rows === [[Just "a"], [Just "c"]]
+    other -> do annotateShow other; failure
+
+prop_not_in_subquery :: Property
+prop_not_in_subquery = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t1 (id INT NOT NULL, name TEXT)"
+    _ <- execSQL db "CREATE TABLE t2 (id INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t1 (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+    _ <- execSQL db "INSERT INTO t2 (id) VALUES (1), (3)"
+    execSQL db "SELECT name FROM t1 WHERE NOT id IN (SELECT id FROM t2)"
+  case result of
+    RowResult _ rows -> rows === [[Just "b"]]
+    other -> do annotateShow other; failure
+
+prop_in_subquery_empty :: Property
+prop_in_subquery_empty = withTests 1 $ property $ do
+  result <- expectExecRight $ withFreshDb $ \db -> do
+    _ <- execSQL db "CREATE TABLE t1 (id INT NOT NULL)"
+    _ <- execSQL db "CREATE TABLE t2 (id INT NOT NULL)"
+    _ <- execSQL db "INSERT INTO t1 (id) VALUES (1), (2)"
+    execSQL db "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2)"
+  case result of
+    RowResult _ rows -> rows === []
     other -> do annotateShow other; failure
